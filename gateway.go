@@ -87,6 +87,11 @@ func (gw *Gateway) acquire(ctx context.Context) (*Gemini, func(), error) {
 	return gemini, release, nil
 }
 
+// queueDepth reporta quantos requests esperam (para o painel).
+func (gw *Gateway) queueDepth() int {
+	return len(gw.queue)
+}
+
 // status reporta saúde sem bloquear atrás de uma geração em andamento.
 func (gw *Gateway) status() map[string]string {
 	// alguém executando? não dá para verificar agora — e isso é informação

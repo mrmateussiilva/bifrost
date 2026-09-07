@@ -27,7 +27,7 @@ MVP funcional, testado de ponta a ponta (2026-09-05):
 - [x] **Extração estruturada**: code blocks viram fences de markdown (sem o rótulo da linguagem vazando), títulos com `#`, listas com marcadores
 - [x] **Function calling simulado**: `tools` do request viram protocolo no prompt; chamadas viram `tool_calls` no formato OpenAI (stream e não-stream); resultados de tool voltam como mensagens `[TOOL]`; retratativa automática de recusa
 - [x] **API key opcional** (`Authorization: Bearer` ou `X-Api-Key`)
-- [x] Nível de log via env (`BIFROST_LOG`)
+- [x] **Painel de observação** (Evolution API-style): `/panel` — dashboard HTML com estado ao vivo (polling), fila, contadores, logs e histórico de requests
 - [x] **Docker**: imagem multi-stage (Go + google-chrome-stable), compose com bind mount do profile, healthcheck — ver [Docker](#docker-produção-e-desenvolvimento)
 - [ ] múltiplos providers (fora de escopo do MVP)
 
@@ -39,6 +39,9 @@ MVP funcional, testado de ponta a ponta (2026-09-05):
 | `/v1/models` | GET | lista de modelos |
 | `/v1/models/{model}` | GET | detalhe do modelo |
 | `/v1/chat/completions` | POST | chat completion (corpo OpenAI; exige `Content-Type: application/json`) |
+| `/panel` | GET | dashboard de observação (HTML, polling 2s) |
+| `/panel/data` | GET | JSON: status do browser, fila, contadores, logs recentes, histórico e request ativo |
+| `/` | GET | redireciona para `/panel` |
 
 Exemplo:
 
@@ -72,6 +75,18 @@ A UI web do Gemini não tem protocolo nativo de ferramentas — o Bifrost simula
 4. O cliente executa e devolve `{"role":"tool", "tool_call_id", "content"}`; no histórico serializado, chamadas do assistente voltam como fences e resultados como mensagens `[TOOL nome]`.
 
 O prior de segurança do Gemini web ("não tenho acesso ao seu computador") é **probabilístico** — mais forte para ferramentas de arquivo/comando do que para consultas. O Bifrost inspeciona o começo da resposta e, em recusa, re-executa com uma mensagem corretiva (no streaming, antes de qualquer byte chegar ao cliente; até 2 retratativas, a última sem inspeção). Efetivo em ~9 de cada 10 turnos; cada retratativa custa uma geração (~6s). `tool_choice` aceita `auto` (default), `none` e `required`.
+
+### Painel de observação
+
+Acesse em `http://localhost:8081/panel`. O painel faz polling a cada 2s no `/panel/data` (JSON) e renderiza:
+
+- **Estado do browser e fila** — se está ocupado, quantos na fila, capacidade
+- **Contadores** — requests, erros, recusas de fila, recusas de tool, tool calls
+- **Request ativo ao vivo** — modelo, prompt (primeiros 100 chars), se tem tools, tempo decorrido, retries
+- **Histórico** — os 30 requests mais recentes, ordenados do mais recente ao mais antigo (cor verde/vermelha = ok/erro)
+- **Logs** — as 12 linhas de log mais recentes, cor por nível (debug cinza, info preto, warn laranja, error vermelho)
+
+Os dados ficam em ring buffers em memória — somem no restart. A rota `/` redireciona automaticamente para `/panel`. Também serve de cheat-sheet: o botão ao lado do título (`/panel`) copia o JSON mais recente no clipboard.
 
 ## Modelos
 
@@ -196,6 +211,7 @@ A partir daí o Bifrost (headed ou headless) reutiliza a sessão. Se algum dia a
 | `gemini.go` | **Todos os seletores do Gemini** (`GeminiSelectors`), `Gemini.Complete` (mutex, digitação, envio, espera por DOM, troca de modo) |
 | `openai.go` | Tipos e handlers OpenAI, middleware REST (request-id, CORS, access log, recover, auth) |
 | `gateway.go` | Supervisão do Chromium: relança se morrer, serializa execuções, limita fila |
+| `panel.go` | Painel de observação: ring buffers em memória, contadores, rastro de requests, tee do slog, handlers HTTP |
 | `config.go` | Env vars |
 
 Princípios do `Complete` (uma requisição por vez, `sync.Mutex`):
@@ -257,4 +273,5 @@ journalctl --user -u bifrost -f          # logs
 - Function calling é simulado via prompt: o Gemini web às vezes recusa ferramentas de arquivo/comando — o Bifrost retenta com correção (~90% de sucesso efetivo); recusa persistente chega como texto e o agente cliente reage;
 - Tokens do `usage` são estimados;
 - Sem autenticação na API (`api_key` ignorada) — para uso local;
-- `login` sempre abre janela (headless é ignorado nesse comando, por óbvio).
+- `login` sempre abre janela (headless é ignorado nesse comando, por óbvio);
+- Painel é volátil: contadores e requests somem no restart (ring buffers em memória).

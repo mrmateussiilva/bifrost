@@ -239,6 +239,7 @@ func handleChat(gw *Gateway) http.HandlerFunc {
 		// na cara em vez de cliente preso por minutos
 		leave, ok := gw.tryAdmit()
 		if !ok {
+			thePanel.reject()
 			writeAPIError(w, http.StatusTooManyRequests, "rate_limit_error", "queue_full",
 				"fila cheia; tente novamente em instantes")
 			return
@@ -252,6 +253,7 @@ func handleChat(gw *Gateway) http.HandlerFunc {
 
 		g, release, err := gw.acquire(ctx)
 		if err != nil {
+			thePanel.reject()
 			if errors.Is(err, context.DeadlineExceeded) {
 				writeAPIError(w, http.StatusGatewayTimeout, "rate_limit_error", "queue_timeout",
 					"tempo esgotado aguardando a vez na fila")
@@ -277,14 +279,20 @@ func handleChat(gw *Gateway) http.HandlerFunc {
 		promptText := SerializeMessages(msgs)
 		slog.Info("request received", "messages", len(msgs), "model", req.Model, "stream", req.Stream, "tools", len(req.Tools))
 
+		// rastro para o painel: começa quando o request ganhou a vez
+		rec := thePanel.begin(req.Model, req.Stream, len(req.Tools), promptPreview(promptText, 110))
+		defer thePanel.end(rec)
+
 		if req.Stream {
-			streamChatCompletion(w, ctx, g, req, msgs, promptText)
+			streamChatCompletion(w, ctx, g, req, msgs, promptText, rec)
 			return
 		}
 
 		text, err := g.Complete(ctx, msgs, modeByID(req.Model))
 		if err != nil {
 			slog.Error("completion falhou", "err", err)
+			_, _, code, _ := completionErrorInfo(err)
+			thePanel.mutate(rec, func(r *reqRecord) { r.Status = code })
 			writeCompletionError(w, err)
 			return
 		}
@@ -300,6 +308,7 @@ func handleChat(gw *Gateway) http.HandlerFunc {
 		// no vácuo — conversa nova a cada requisição)
 		if len(calls) == 0 && len(req.Tools) > 0 && looksLikeRefusal(content) {
 			slog.Warn("recusa de ferramenta detectada; retentando com correção")
+			thePanel.noteRetry(rec)
 			retryMsgs := make([]Message, 0, len(msgs)+1)
 			retryMsgs = append(retryMsgs, msgs...)
 			retryMsgs = append(retryMsgs, Message{Role: "system", Content: refusalCorrection})
@@ -311,6 +320,11 @@ func handleChat(gw *Gateway) http.HandlerFunc {
 
 		if len(calls) > 0 {
 			slog.Info("tool calls parsed", "calls", len(calls))
+			thePanel.mutate(rec, func(r *reqRecord) {
+				r.Status = "tool_calls"
+				r.ToolCalls = len(calls)
+				r.Chars = len(content)
+			})
 			writeJSON(w, http.StatusOK, ChatCompletionResponse{
 				ID:      "chatcmpl-bifrost-" + randomID(),
 				Object:  "chat.completion",
@@ -327,6 +341,10 @@ func handleChat(gw *Gateway) http.HandlerFunc {
 			return
 		}
 
+		thePanel.mutate(rec, func(r *reqRecord) {
+			r.Status = "ok"
+			r.Chars = len(text)
+		})
 		writeJSON(w, http.StatusOK, ChatCompletionResponse{
 			ID:      "chatcmpl-bifrost-" + randomID(),
 			Object:  "chat.completion",
@@ -394,7 +412,7 @@ func (s *sseWriter) raw(msg string) {
 // conteúdo — o loop de streaming os retém). Erros ANTES do primeiro byte
 // saem como status HTTP normais; depois dele, como evento de erro + [DONE]
 // — o protocolo não permite trocar o status no meio do stream.
-func streamChatCompletion(w http.ResponseWriter, ctx context.Context, g *Gemini, req ChatCompletionRequest, msgs []Message, promptText string) {
+func streamChatCompletion(w http.ResponseWriter, ctx context.Context, g *Gemini, req ChatCompletionRequest, msgs []Message, promptText string, rec *reqRecord) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeAPIError(w, http.StatusInternalServerError, errAPIError, "stream_unavailable",
@@ -441,6 +459,7 @@ func streamChatCompletion(w http.ResponseWriter, ctx context.Context, g *Gemini,
 			}
 		}
 		chunk(chunkDelta{Content: d}, nil)
+		thePanel.addChars(rec, len(d))
 		return nil
 	}
 	attempt := func(msgs []Message, check bool) (string, error) {
@@ -452,6 +471,7 @@ func streamChatCompletion(w http.ResponseWriter, ctx context.Context, g *Gemini,
 	finalText, err := attempt(msgs, true)
 	if errors.Is(err, errRefusalDetected) {
 		slog.Warn("recusa de ferramenta detectada (stream); retentando com correção")
+		thePanel.noteRetry(rec)
 		retryMsgs := make([]Message, 0, len(msgs)+1)
 		retryMsgs = append(retryMsgs, msgs...)
 		retryMsgs = append(retryMsgs, Message{Role: "system", Content: refusalCorrection})
@@ -460,6 +480,7 @@ func streamChatCompletion(w http.ResponseWriter, ctx context.Context, g *Gemini,
 			// insistiu na recusa: última tentativa sem inspeção — o que
 			// vier vai ao cliente (recusa visível, o agente reage)
 			slog.Warn("recusa persistente; última tentativa sem inspeção")
+			thePanel.noteRetry(rec)
 			finalText, err = attempt(retryMsgs, false)
 		}
 	}
@@ -496,10 +517,16 @@ func streamChatCompletion(w http.ResponseWriter, ctx context.Context, g *Gemini,
 		}
 		finish := "tool_calls"
 		chunk(chunkDelta{}, &finish)
+		thePanel.mutate(rec, func(r *reqRecord) {
+			r.Status = "tool_calls"
+			r.ToolCalls = len(calls)
+		})
 	} else {
 		finish := "stop"
 		chunk(chunkDelta{}, &finish)
+		thePanel.mutate(rec, func(r *reqRecord) { r.Status = "ok" })
 	}
+	thePanel.mutate(rec, func(r *reqRecord) { r.Chars = len(finalText) })
 	if req.StreamOptions != nil && req.StreamOptions.IncludeUsage {
 		u := estimateUsage(promptText, finalText)
 		s.event(chatCompletionChunk{

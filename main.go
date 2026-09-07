@@ -54,9 +54,10 @@ func main() {
 	flag.Parse()
 
 	cfg := LoadConfig()
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-		Level: logLevel(cfg.LogLevel),
-	})))
+	lvl := logLevel(cfg.LogLevel)
+	// as linhas de log também alimentam o painel (tee)
+	slog.SetDefault(slog.New(thePanel.logTee(
+		slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl}), lvl)))
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -294,6 +295,11 @@ func runServe(ctx context.Context, cfg Config) error {
 		writeAPIError(w, http.StatusMethodNotAllowed, errInvalidRequest, "method_not_allowed", r.Method+" não suportado em "+r.URL.Path)
 	})
 	router.Get("/health", handleHealth(gw))
+	router.Get("/", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/panel", http.StatusFound)
+	})
+	router.Get("/panel", handlePanel)
+	router.Get("/panel/data", handlePanelData(gw))
 	router.Route("/v1", func(v1 chi.Router) {
 		v1.Get("/models", handleModels)
 		v1.Get("/models/{model}", handleModel)
