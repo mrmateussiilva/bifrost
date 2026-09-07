@@ -1,0 +1,4 @@
+# profile do Chrome: cookies da sessão Google — nunca commitar
+data/
+# binário de build local
+/bifrost

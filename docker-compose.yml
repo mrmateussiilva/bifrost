@@ -1,0 +1,15 @@
+services:
+  bifrost:
+    build: .
+    image: bifrost:latest
+    container_name: bifrost
+    ports:
+      - "8081:8080" # 8080 do host está ocupado (Alexandria)
+    volumes:
+      - ./data/chrome-profile:/data/chrome-profile
+    shm_size: "1gb" # Chrome precisa de mais que os 64MB default
+    restart: unless-stopped
+    # environment:
+    #   BIFROST_API_KEY: troque-por-uma-chave-bem-longa
+    #   BIFROST_LOG: info
+    #   BIFROST_MODEL: gemini-web-flash

@@ -1,0 +1,8 @@
+# O profile contém os cookies da sessão Google — NUNCA entra na imagem.
+data/
+bifrost
+*.md
+.git
+.gitignore
+Dockerfile
+docker-compose.yml
