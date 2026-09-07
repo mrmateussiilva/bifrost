@@ -25,10 +25,11 @@ MVP funcional, testado de ponta a ponta (2026-09-05):
 - [x] **Fila limitada**: 1 executando + 4 esperando; acima disso `429`
 - [x] **Desconexão do cliente aborta a geração** (stream e não-stream) — sem esperar o fim no vácuo
 - [x] **Extração estruturada**: code blocks viram fences de markdown (sem o rótulo da linguagem vazando), títulos com `#`, listas com marcadores
+- [x] **Function calling simulado**: `tools` do request viram protocolo no prompt; chamadas viram `tool_calls` no formato OpenAI (stream e não-stream); resultados de tool voltam como mensagens `[TOOL]`; retratativa automática de recusa
 - [x] **API key opcional** (`Authorization: Bearer` ou `X-Api-Key`)
 - [x] Nível de log via env (`BIFROST_LOG`)
 - [x] **Docker**: imagem multi-stage (Go + google-chrome-stable), compose com bind mount do profile, healthcheck — ver [Docker](#docker-produção-e-desenvolvimento)
-- [ ] function calling/tools, múltiplos providers (fora de escopo do MVP)
+- [ ] múltiplos providers (fora de escopo do MVP)
 
 ## Endpoints
 
@@ -60,6 +61,17 @@ curl -N http://localhost:8081/v1/chat/completions \
 ```
 
 Como o texto vem do DOM da UI web, a emissão é **por parágrafo** (bloco estável), não por token: uma part só vai ao cliente quando existe há 3 polls (~0,9s) sem mudar e já tem irmã depois dela — o Gemini continua escrevendo um parágrafo depois de já criar o elemento seguinte, e re-parseia markdown da part viva (asteriscos viram `<strong>`, parágrafos se dividem), então "texto presente" não significa "texto estável". Part já emitida que é re-renderizada depois (raro) deixa o cliente com a versão anterior — o stream segue até o fim; truncar seria pior. Desconectar no meio aborta a geração no servidor.
+
+### Function calling (simulado)
+
+A UI web do Gemini não tem protocolo nativo de ferramentas — o Bifrost simula, ponta a ponta no formato OpenAI:
+
+1. As `tools` do request entram no prompt como bloco `[SYSTEM]` no fim: framing de agente (as ferramentas são reais, instaladas e autorizadas pelo usuário), os schemas e um exemplo de uso completo;
+2. O modelo chama uma ferramenta com um **code block contendo apenas o JSON** `{"name": ..., "arguments": {...}}`. A detecção é pelo conteúdo com **nome de ferramenta declarada** — o rótulo de linguagem do code block não serve, porque a UI do Gemini substitui rótulos desconhecidos por um genérico localizado ("Snippet de código");
+3. O Bifrost traduz para `choices[0].message.tool_calls` + `finish_reason:"tool_calls"` (no streaming, `delta.tool_calls` indexados; os blocos de chamada **nunca** vazam como conteúdo);
+4. O cliente executa e devolve `{"role":"tool", "tool_call_id", "content"}`; no histórico serializado, chamadas do assistente voltam como fences e resultados como mensagens `[TOOL nome]`.
+
+O prior de segurança do Gemini web ("não tenho acesso ao seu computador") é **probabilístico** — mais forte para ferramentas de arquivo/comando do que para consultas. O Bifrost inspeciona o começo da resposta e, em recusa, re-executa com uma mensagem corretiva (no streaming, antes de qualquer byte chegar ao cliente; até 2 retratativas, a última sem inspeção). Efetivo em ~9 de cada 10 turnos; cada retratativa custa uma geração (~6s). `tool_choice` aceita `auto` (default), `none` e `required`.
 
 ## Modelos
 
@@ -242,6 +254,7 @@ journalctl --user -u bifrost -f          # logs
 
 - Uma requisição executa por vez; até 4 esperam na fila (acima disso `429`, espera excessiva `504`);
 - Streaming emite por parágrafo estável (não por token) — consequência de ler o DOM da UI web; part já emitida que o Gemini re-renderiza depois (raro) fica com a versão anterior no cliente;
+- Function calling é simulado via prompt: o Gemini web às vezes recusa ferramentas de arquivo/comando — o Bifrost retenta com correção (~90% de sucesso efetivo); recusa persistente chega como texto e o agente cliente reage;
 - Tokens do `usage` são estimados;
 - Sem autenticação na API (`api_key` ignorada) — para uso local;
 - `login` sempre abre janela (headless é ignorado nesse comando, por óbvio).

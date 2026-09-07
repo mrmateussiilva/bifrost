@@ -245,15 +245,38 @@ func NewGemini(ctx context.Context) *Gemini {
 	return &Gemini{ctx: ctx}
 }
 
-// SerializeMessages transforma o histórico OpenAI em um prompt textual —
-// a UI web do Gemini não aceita histórico estruturado.
+// SerializeMessages transforma o histórico OpenAI em um prompt textual — a
+// UI web do Gemini não aceita histórico estruturado. Chamadas de ferramenta
+// do assistente viram fences tool_call (o formato que o próprio modelo foi
+// instruído a emitir) e resultados chegam como mensagens [TOOL nome].
 func SerializeMessages(messages []Message) string {
 	var b strings.Builder
+	toolNames := map[string]string{} // tool_call_id → nome da função
 	for _, m := range messages {
-		if m.Content == "" {
-			continue
+		switch {
+		case m.Role == "tool":
+			label := "TOOL"
+			if name := toolNames[m.ToolCallID]; name != "" {
+				label = "TOOL " + name
+			}
+			fmt.Fprintf(&b, "[%s]\n%s\n\n", label, m.Content)
+		case m.Content == "" && len(m.ToolCalls) == 0:
+			// mensagem vazia: nada a serializar
+		default:
+			fmt.Fprintf(&b, "[%s]\n", strings.ToUpper(m.Role))
+			if m.Content != "" {
+				fmt.Fprintf(&b, "%s\n", m.Content)
+			}
+			for _, tc := range m.ToolCalls {
+				toolNames[tc.ID] = tc.Function.Name
+				args := tc.Function.Arguments
+				if !json.Valid([]byte(args)) {
+					args = "{}"
+				}
+				fmt.Fprintf(&b, "%stool_call\n{\"name\": %q, \"arguments\": %s}\n%s\n", fence, tc.Function.Name, args, fence)
+			}
+			b.WriteString("\n")
 		}
-		fmt.Fprintf(&b, "[%s]\n%s\n\n", strings.ToUpper(m.Role), m.Content)
 	}
 	return strings.TrimRight(b.String(), "\n")
 }
@@ -337,15 +360,40 @@ type genState struct {
 	StopButton bool      `json:"stopButton"`
 }
 
+// looksLikeToolCallJSON: conteúdo de code block com forma de chamada de
+// ferramenta (JSON com "name" e "arguments"). O rótulo de linguagem NÃO
+// serve para detectar chamadas — a UI do Gemini substitui rótulos
+// desconhecidos por um genérico localizado ("Snippet de código").
+func looksLikeToolCallJSON(code string) bool {
+	c := strings.TrimSpace(code)
+	if !strings.HasPrefix(c, "{") {
+		return false
+	}
+	return strings.Contains(c, `"name"`) && strings.Contains(c, `"arguments"`)
+}
+
+// isToolCallPart: code block com forma de chamada de ferramenta — retido na
+// emissão de streaming (a classificação final, com o nome declarado, é do
+// parser do handler; a retenção é só pela forma, e é segura porque part
+// só é emitida estável e completa).
+func isToolCallPart(p genPart) bool {
+	return p.Kind == "code" && looksLikeToolCallJSON(p.Code)
+}
+
 // assembleText monta o texto da resposta a partir das parts: parágrafos
 // preservados, code blocks como fences de markdown (sem o rótulo da
-// linguagem vazando). Todos os fences fecham — quem chama decide quais
-// parts entram (no streaming, só as completas).
-func assembleText(parts []genPart) string {
+// linguagem vazando). skipToolCalls=true omite os code blocks com forma de
+// chamada de ferramenta — na emissão de streaming eles são protocolo
+// (traduzidos para delta.tool_calls no fim), nunca conteúdo; o texto final
+// os inclui para o parser classificar.
+func assembleText(parts []genPart, skipToolCalls bool) string {
 	var b strings.Builder
 	for _, p := range parts {
 		if p.Kind == "code" {
 			if strings.TrimSpace(p.Lang) == "" && strings.TrimSpace(p.Code) == "" {
+				continue
+			}
+			if skipToolCalls && isToolCallPart(p) {
 				continue
 			}
 			if b.Len() > 0 {
@@ -420,12 +468,14 @@ func (g *Gemini) Complete(ctx context.Context, messages []Message, mode *geminiM
 // que o envio do prompt está confirmado — o momento certo de escrever os
 // cabeçalhos SSE, porque erros anteriores (sessão, DOM, envio) ainda podem
 // virar status HTTP de verdade; onDelta recebe cada acréscimo de texto
-// enquanto a geração corre.
-func (g *Gemini) CompleteStream(ctx context.Context, messages []Message, mode *geminiMode, onStart func() error, onDelta func(string)) (string, error) {
+// enquanto a geração corre — e pode devolver erro para ABORTAR a emissão
+// (o handler usa isso para detectar recusa de ferramenta antes de qualquer
+// byte chegar ao cliente e retentar com correção).
+func (g *Gemini) CompleteStream(ctx context.Context, messages []Message, mode *geminiMode, onStart func() error, onDelta func(string) error) (string, error) {
 	return g.complete(ctx, messages, mode, onStart, onDelta)
 }
 
-func (g *Gemini) complete(ctx context.Context, messages []Message, mode *geminiMode, onStart func() error, onDelta func(string)) (string, error) {
+func (g *Gemini) complete(ctx context.Context, messages []Message, mode *geminiMode, onStart func() error, onDelta func(string) error) (string, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
@@ -592,7 +642,7 @@ func (g *Gemini) waitResponse(ctx context.Context, responsesBefore int) (string,
 		}
 		st, err := g.generationState(ctx)
 		if err == nil && st.Responses > responsesBefore {
-			if text := assembleText(st.Parts); text != "" {
+			if text := assembleText(st.Parts, false); text != "" {
 				if text == last {
 					stable++
 				} else {
@@ -615,8 +665,9 @@ func (g *Gemini) waitResponse(ctx context.Context, responsesBefore int) (string,
 // seguinte, então "ter irmã" sozinho não prova nada. A última part sai
 // apenas no fim, com o texto final. Part já emitida que muda (re-parse
 // raro) deixa o cliente com a versão anterior — o stream segue; truncar
-// a resposta seria pior.
-func (g *Gemini) streamResponse(ctx context.Context, responsesBefore int, onDelta func(string)) (string, error) {
+// a resposta seria pior. Fences tool_call NUNCA são emitidos como
+// conteúdo: são protocolo (o handler os traduz para delta.tool_calls).
+func (g *Gemini) streamResponse(ctx context.Context, responsesBefore int, onDelta func(string) error) (string, error) {
 	const stableNeeded = 3
 	var prev []genPart  // parts do poll anterior
 	var stab []int      // polls consecutivos sem mudar, por índice
@@ -651,12 +702,14 @@ func (g *Gemini) streamResponse(ctx context.Context, responsesBefore int, onDelt
 				emitCount = i + 1
 			}
 			if emitCount > emitted {
-				delta := assembleText(cur[emitted:emitCount])
+				delta := assembleText(cur[emitted:emitCount], true)
 				if sentText != "" && delta != "" {
 					delta = "\n\n" + delta
 				}
 				if delta != "" {
-					onDelta(delta)
+					if err := onDelta(delta); err != nil {
+						return "", fmt.Errorf("emissão abortada pelo callback: %w", err)
+					}
 					sentText += delta
 				}
 				emitted = emitCount
@@ -677,7 +730,7 @@ func (g *Gemini) streamResponse(ctx context.Context, responsesBefore int, onDelt
 			}
 
 			// fim: texto completo estável + botão parar ausente
-			if full := assembleText(st.Parts); full != "" {
+			if full := assembleText(st.Parts, false); full != "" {
 				if full == lastFull {
 					stableFull++
 				} else {
@@ -686,12 +739,14 @@ func (g *Gemini) streamResponse(ctx context.Context, responsesBefore int, onDelt
 				}
 				if stableFull >= stableNeeded && !st.StopButton {
 					if len(st.Parts) > emitted {
-						delta := assembleText(st.Parts[emitted:])
+						delta := assembleText(st.Parts[emitted:], true)
 						if sentText != "" && delta != "" {
 							delta = "\n\n" + delta
 						}
 						if delta != "" {
-							onDelta(delta)
+							if err := onDelta(delta); err != nil {
+								return "", fmt.Errorf("emissão abortada pelo callback: %w", err)
+							}
 						}
 					}
 					return full, nil
