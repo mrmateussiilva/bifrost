@@ -124,7 +124,7 @@ func runLogin(ctx context.Context, cfg Config) error {
 	}
 	defer browser.Close()
 
-	if err := OpenGemini(browser.Ctx); err != nil {
+	if err := OpenGemini(browser.BootCtx); err != nil {
 		return err
 	}
 
@@ -137,10 +137,10 @@ func runLogin(ctx context.Context, cfg Config) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-browser.Ctx.Done():
+		case <-browser.BootCtx.Done():
 			return fmt.Errorf("chromium fechou antes da sessão ser confirmada")
 		case <-ticker.C:
-			state, url, err := GeminiState(browser.Ctx)
+			state, url, err := GeminiState(browser.BootCtx)
 			if err != nil {
 				continue // navegação em andamento; tenta de novo no próximo tick
 			}
@@ -154,7 +154,7 @@ func runLogin(ctx context.Context, cfg Config) error {
 				slog.Info("pode fechar a janela do Chromium (ou Ctrl+C) para encerrar")
 				select {
 				case <-ctx.Done():
-				case <-browser.Ctx.Done():
+				case <-browser.BootCtx.Done():
 				}
 				return nil
 			case stateLoginNeeded:
@@ -177,13 +177,13 @@ func runInspect(ctx context.Context, cfg Config) error {
 	}
 	defer browser.Close()
 
-	if err := OpenGemini(browser.Ctx); err != nil {
+	if err := OpenGemini(browser.BootCtx); err != nil {
 		return err
 	}
 
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		state, _, err := GeminiState(browser.Ctx)
+		state, _, err := GeminiState(browser.BootCtx)
 		if err == nil {
 			if state == stateLoggedIn {
 				break
@@ -200,14 +200,14 @@ func runInspect(ctx context.Context, cfg Config) error {
 		time.Sleep(300 * time.Millisecond)
 	}
 
-	dump, err := InspectGemini(browser.Ctx)
+	dump, err := InspectGemini(browser.BootCtx)
 	if err != nil {
 		return err
 	}
 	fmt.Println(dump)
 
 	var shot []byte
-	if err := chromedp.Run(browser.Ctx, chromedp.ActionFunc(func(c context.Context) error {
+	if err := chromedp.Run(browser.BootCtx, chromedp.ActionFunc(func(c context.Context) error {
 		buf, err := page.CaptureScreenshot().Do(c)
 		if err != nil {
 			return err
@@ -233,21 +233,21 @@ func runTest(ctx context.Context, cfg Config, prompt string) error {
 	}
 	defer browser.Close()
 
-	if err := OpenGemini(browser.Ctx); err != nil {
+	if err := OpenGemini(browser.BootCtx); err != nil {
 		return err
 	}
 
-	g := NewGemini(browser.Ctx)
+	g := NewGemini(browser.BootCtx)
 
 	// toda chamada ao Gemini tem timeout
 	cctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 	defer cancel()
 
 	slog.Info("request received", "prompt", prompt)
-	resp, err := g.Complete(cctx, []Message{{Role: "user", Content: prompt}}, nil)
+	resp, err := g.Complete(cctx, []Message{{Role: "user", Content: prompt}}, cfg.Model)
 	if err != nil {
 		// em caso de falha, despeja o DOM para diagnosticar seletores
-		if dump, derr := InspectGemini(browser.Ctx); derr == nil {
+		if dump, derr := InspectGemini(browser.BootCtx); derr == nil {
 			slog.Error("falhou; despejo do DOM para diagnóstico:")
 			fmt.Println(dump)
 		}
@@ -260,7 +260,7 @@ func runTest(ctx context.Context, cfg Config, prompt string) error {
 	// deixa a UI pós-resposta (chips de follow-up etc.) renderizar, para o
 	// dump mostrar o que NÃO deve entrar na extração.
 	time.Sleep(5 * time.Second)
-	if dump, derr := ResponseStructure(browser.Ctx); derr == nil {
+	if dump, derr := ResponseStructure(browser.BootCtx); derr == nil {
 		fmt.Println("--- estrutura da última resposta ---")
 		fmt.Println(dump)
 	} else {
@@ -271,11 +271,7 @@ func runTest(ctx context.Context, cfg Config, prompt string) error {
 
 // runServe sobe a API HTTP OpenAI-compatible sobre o Gemini Web.
 func runServe(ctx context.Context, cfg Config) error {
-	if cfg.Model != "" && cfg.Model != geminiWebModel && modeByID(cfg.Model) == nil {
-		return fmt.Errorf("BIFROST_MODEL inválida: %q — válidos: %s", cfg.Model, validModelIDs())
-	}
-
-	gw := NewGateway(ctx, cfg)
+	gw := NewGateway(ctx, cfg, GetProvider(cfg.Provider))
 	defer gw.close()
 
 	// warm-up: browser de pé antes de abrir a porta
@@ -294,15 +290,20 @@ func runServe(ctx context.Context, cfg Config) error {
 	router.MethodNotAllowed(func(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusMethodNotAllowed, errInvalidRequest, "method_not_allowed", r.Method+" não suportado em "+r.URL.Path)
 	})
+	router.Get("/favicon.ico", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
 	router.Get("/health", handleHealth(gw))
 	router.Get("/", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/panel", http.StatusFound)
 	})
 	router.Get("/panel", handlePanel)
 	router.Get("/panel/data", handlePanelData(gw))
+	router.Post("/panel/login", handlePanelLogin(gw))
+	router.Get("/panel/login/status", handlePanelLoginStatus(gw))
 	router.Route("/v1", func(v1 chi.Router) {
-		v1.Get("/models", handleModels)
-		v1.Get("/models/{model}", handleModel)
+		v1.Get("/models", handleModels(gw))
+		v1.Get("/models/{model}", handleModel(gw))
 		v1.Post("/chat/completions", handleChat(gw))
 	})
 
@@ -342,13 +343,13 @@ func runModes(ctx context.Context, cfg Config) error {
 	}
 	defer browser.Close()
 
-	if err := OpenGemini(browser.Ctx); err != nil {
+	if err := OpenGemini(browser.BootCtx); err != nil {
 		return err
 	}
 
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		state, _, err := GeminiState(browser.Ctx)
+		state, _, err := GeminiState(browser.BootCtx)
 		if err == nil && state == stateLoggedIn {
 			break
 		}
@@ -363,7 +364,7 @@ func runModes(ctx context.Context, cfg Config) error {
 	deadline = time.Now().Add(10 * time.Second)
 	for {
 		var has string
-		if err := chromedp.Run(browser.Ctx, chromedp.Evaluate(fmt.Sprintf(`(() => {
+		if err := chromedp.Run(browser.BootCtx, chromedp.Evaluate(fmt.Sprintf(`(() => {
 			return document.querySelector(%q) ? '1' : '';
 		})()`, geminiSelectors.ModeSwitcher), &has)); err == nil && has == "1" {
 			break
@@ -396,7 +397,7 @@ func runModes(ctx context.Context, cfg Config) error {
 	})())`
 
 	var dummy, initialLabel, rawItems string
-	if err := chromedp.Run(browser.Ctx,
+	if err := chromedp.Run(browser.BootCtx,
 		chromedp.Evaluate(readLabel, &initialLabel),
 		chromedp.Evaluate(openMenu, &dummy),
 		chromedp.Sleep(500*time.Millisecond),
@@ -416,7 +417,7 @@ func runModes(ctx context.Context, cfg Config) error {
 
 	for i, item := range items {
 		var post string
-		err := chromedp.Run(browser.Ctx,
+		err := chromedp.Run(browser.BootCtx,
 			chromedp.Evaluate(openMenu, &dummy),
 			chromedp.Sleep(400*time.Millisecond),
 			chromedp.Evaluate(fmt.Sprintf(`(() => {

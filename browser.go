@@ -17,8 +17,9 @@ import (
 // Browser controla uma única instância do Chromium com profile persistente,
 // uma aba e um contexto chromedp para todas as ações.
 type Browser struct {
-	Ctx    context.Context
-	cancel context.CancelFunc
+	AllocCtx context.Context
+	BootCtx  context.Context
+	cancel   context.CancelFunc
 }
 
 // headlessFlag devolve o valor para a flag --headless: "new" (o modo atual,
@@ -76,16 +77,19 @@ func StartBrowser(ctx context.Context, cfg Config) (*Browser, error) {
 		allocCtx, cancelAlloc := chromedp.NewExecAllocator(ctx, opts...)
 		browserCtx, cancelBrowser := chromedp.NewContext(allocCtx)
 
-		// O chromedp só lança o processo de fato na primeira ação.
 		if err := chromedp.Run(browserCtx, chromedp.Navigate("about:blank")); err != nil {
 			cancelBrowser()
 			cancelAlloc()
 			return nil, err
 		}
-		return &Browser{Ctx: browserCtx, cancel: func() {
-			cancelBrowser()
-			cancelAlloc()
-		}}, nil
+		return &Browser{
+			AllocCtx: allocCtx,
+			BootCtx:  browserCtx,
+			cancel: func() {
+				cancelBrowser()
+				cancelAlloc()
+			},
+		}, nil
 	}
 
 	browser, err := tryStart()
@@ -149,14 +153,14 @@ func clearStaleSingletonLock(profileDir string) bool {
 // Alive reporta se o Chromium ainda está de pé. O contexto do chromedp é
 // cancelado automaticamente quando o browser morre.
 func (b *Browser) Alive() bool {
-	return b.Ctx.Err() == nil
+	return b.BootCtx.Err() == nil
 }
 
 // Close encerra o Chromium com Browser.close (graceful, grava o profile);
 // em qualquer falha cai no cancelamento dos contextos, que mata o processo.
 func (b *Browser) Close() {
-	if b.Ctx.Err() == nil {
-		ctx, cancel := context.WithTimeout(b.Ctx, 3*time.Second)
+	if b.BootCtx.Err() == nil {
+		ctx, cancel := context.WithTimeout(b.BootCtx, 3*time.Second)
 		if err := chromedp.Run(ctx, chromedp.ActionFunc(func(c context.Context) error {
 			return browser.Close().Do(c)
 		})); err != nil {

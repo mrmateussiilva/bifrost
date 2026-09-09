@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/chromedp/cdproto/input"
+	"github.com/chromedp/cdproto/runtime"
 	"github.com/chromedp/chromedp"
 )
 
@@ -231,7 +232,13 @@ var (
 	ErrGenerationTimeout = errors.New("gemini generation timed out")
 	ErrResponseNotFound  = errors.New("gemini response not found")
 	ErrBrowserClosed     = errors.New("browser closed")
+	ErrGenerationFailed  = errors.New("gemini generation failed (error shown in UI)")
 )
+
+// maxStickyResponses: acima disso a conversa aderente reabre — conversas
+// muito longas desaceleram a UI do Gemini e acumulam desvio de contexto;
+// o histórico completo é reenviado numa conversa nova.
+const maxStickyResponses = 30
 
 // Gemini adapta a interface web: ctx é o contexto chromedp da aba (dono: o
 // Browser) e mu garante uma interação por vez — duas prompts simultâneas na
@@ -239,10 +246,145 @@ var (
 type Gemini struct {
 	ctx context.Context
 	mu  sync.Mutex
+
+	// Conversa aderente: o cliente OpenAI (agente) reenvia o histórico
+	// completo a cada turno; quando ele é continuação do que já está na
+	// conversa do Gemini (prefixo casa, mesmo modelo, mesma contagem de
+	// respostas), só o delta é digitado — o histórico permanece na
+	// conversa, cached do lado do Google. Retratativas (Nudge) emendam a
+	// correção na MESMA conversa, enxergando a resposta ruim do modelo.
+	stickyOK      bool
+	lastBase      []Message // histórico (sem blocos de controle) presente na conversa
+	lastModel     string    // modelo do último turno (mudou → conversa nova)
+	lastResponses int       // contagem de respostas após o último turno
+	dirty         bool      // último turno falhou com estado incerto: força conversa nova
+
+	// Streaming: canal do MutationObserver (listener CDP → streamResponse).
+	streamMu sync.Mutex
+	streamCh chan streamChunk
+}
+
+type geminiFactory struct{}
+
+func (f *geminiFactory) Name() string {
+	return "gemini"
+}
+
+func (f *geminiFactory) Open(ctx context.Context) error {
+	return OpenGemini(ctx)
+}
+
+func (f *geminiFactory) State(ctx context.Context) (pageState, string, error) {
+	return GeminiState(ctx)
+}
+
+func (f *geminiFactory) NewWorker(ctx context.Context) LLMWorker {
+	return NewGemini(ctx)
+}
+
+func (f *geminiFactory) Models() []modelObject {
+	return []modelObject{
+		{ID: "gemini-web", Object: "model", ContextLength: 1000000},
+		{ID: "gemini-web-flash-lite", Object: "model", ContextLength: 1000000},
+		{ID: "gemini-web-flash", Object: "model", ContextLength: 1000000},
+		{ID: "gemini-web-pro", Object: "model", ContextLength: 1000000},
+		{ID: "gemini-web-pro-extended", Object: "model", ContextLength: 1000000},
+	}
+}
+
+func (f *geminiFactory) DefaultModel() string {
+	return "gemini-web"
 }
 
 func NewGemini(ctx context.Context) *Gemini {
-	return &Gemini{ctx: ctx}
+	g := &Gemini{ctx: ctx}
+	g.listenChunks()
+	return g
+}
+
+// ---------------------------------------------------------------------------
+// Conversa aderente: casamento de histórico e construção do delta.
+// ---------------------------------------------------------------------------
+
+// messagesEqual compara mensagens pelo conteúdo que o cliente reenvia.
+func messagesEqual(a, b Message) bool {
+	if a.Role != b.Role || a.Content != b.Content || a.ToolCallID != b.ToolCallID {
+		return false
+	}
+	if len(a.ToolCalls) != len(b.ToolCalls) {
+		return false
+	}
+	for i := range a.ToolCalls {
+		ta, tb := a.ToolCalls[i], b.ToolCalls[i]
+		if ta.ID != tb.ID || ta.Function.Name != tb.Function.Name || ta.Function.Arguments != tb.Function.Arguments {
+			return false
+		}
+	}
+	return true
+}
+
+// prefixMatch: prev é prefixo de cur (mesmas mensagens, cur pode continuar).
+func prefixMatch(prev, cur []Message) bool {
+	if len(prev) > len(cur) {
+		return false
+	}
+	for i := range prev {
+		if !messagesEqual(prev[i], cur[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// historyBase devolve o histórico "real" da conversa: as mensagens do
+// cliente, sem os blocos de controle do Bifrost (protocolo de tools e
+// correções de retratativa — infraestrutura, não conteúdo de conversa).
+func historyBase(msgs []Message) []Message {
+	base := make([]Message, 0, len(msgs))
+	for _, m := range msgs {
+		if m.Control || m.Nudge {
+			continue
+		}
+		base = append(base, m)
+	}
+	return base
+}
+
+// controlMsgs devolve os blocos de controle (protocolo + correções), na
+// ordem original — reaproveitados no prompt de cada turno.
+func controlMsgs(msgs []Message) []Message {
+	var out []Message
+	for _, m := range msgs {
+		if m.Control || m.Nudge {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+func hasNudge(msgs []Message) bool {
+	for _, m := range msgs {
+		if m.Nudge {
+			return true
+		}
+	}
+	return false
+}
+
+// elideTextAssistants remove as respostas de TEXTO do assistant: na
+// conversa aderente o modelo já as emitiu — reenviá-las duplicaria o
+// contexto (e são o grosso do payload). Assistant com tool_calls fica:
+// o fence é minúsculo, funciona como recap da chamada e mantém o
+// mapeamento tool_call_id → nome que rotula os resultados [TOOL nome].
+func elideTextAssistants(msgs []Message) []Message {
+	out := make([]Message, 0, len(msgs))
+	for _, m := range msgs {
+		if m.Role == "assistant" && len(m.ToolCalls) == 0 {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
 }
 
 // SerializeMessages transforma o histórico OpenAI em um prompt textual — a
@@ -281,67 +423,144 @@ func SerializeMessages(messages []Message) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-// genStateJS retrata a conversa: quantas respostas existem, as parts da
-// última resposta (extraídas por ESTRUTURA — nunca o innerText bruto do
-// code block, que inclui o rótulo da linguagem no header), texto atual no
-// editor e presença do botão "parar" (sinal de geração em andamento).
-func genStateJS() string {
-	return fmt.Sprintf(`JSON.stringify((() => {
-		const responses = document.querySelectorAll(%q);
-		const last = responses.length ? responses[responses.length - 1] : null;
-		const editor = document.querySelector(%q);
-		const stop = document.querySelector(%q);
-		const parts = [];
-		const isCodeHost = el => {
-			const tag = el.tagName.toLowerCase();
-			return tag === 'code-block' || tag === 'response-element';
-		};
-		const pushCode = el => {
-			const cb = el.matches('code-block') ? el : el.querySelector('code-block');
-			if (!cb) return false;
-			const lang = (cb.querySelector('.header-formatted') || {innerText: ''}).innerText.trim();
-			const code = (cb.querySelector('pre') || {innerText: ''}).innerText;
-			if (lang || code.trim()) parts.push({k: 'code', lang: lang, code: code});
-			return true;
-		};
-		const blockTags = new Set(['p','h1','h2','h3','h4','h5','h6','ul','ol','table','blockquote','pre']);
-		const pushText = el => {
-			const tag = el.tagName.toLowerCase();
-			// só blocos de markdown contam como resposta; o resto (chips de
-			// follow-up, rodapés, containers) é enfeite da UI, não conteúdo
-			if (!blockTags.has(tag)) return;
-			let t = '';
-			if (/^h[1-6]$/.test(tag)) t = '#'.repeat(+tag[1]) + ' ' + el.innerText.trim();
-			else if (tag === 'ul' || tag === 'ol') {
-				t = [...el.children].map((li, i) =>
-					(tag === 'ol' ? (i + 1) + '. ' : '- ') + li.innerText.trim()).join('\n');
-			} else t = el.innerText.trim();
-			if (t) parts.push({k: 'text', text: t});
-		};
-		if (last) for (const child of last.children) {
-			if (isCodeHost(child)) {
-				if (!pushCode(child)) pushText(child);
-				continue;
-			}
-			// o texto mora dentro dos contêineres .markdown; os demais
-			// filhos diretos (rodapés, botões) não fazem parte da resposta
-			if ((child.className || '').toString().includes('markdown')) {
-				for (const block of child.children) {
-					if (isCodeHost(block)) {
-						if (!pushCode(block)) pushText(block);
-					} else {
-						pushText(block);
-					}
+// jsPartsFn é a fonte de uma função JS (sel) => parts[]: a extração
+// ESTRUTURAL da última resposta (code blocks com rótulo/código puros do
+// DOM, blocos de markdown como texto — nunca o innerText bruto do code
+// block, cujo header inclui o rótulo da linguagem). Compartilhada pelo
+// polling de estado (genStateJS) e pelo observer de streaming (observerJS).
+const jsPartsFn = `function(sel) {
+	const responses = document.querySelectorAll(sel);
+	const last = responses.length ? responses[responses.length - 1] : null;
+	const parts = [];
+	const isCodeHost = el => {
+		const tag = el.tagName.toLowerCase();
+		return tag === 'code-block' || tag === 'response-element';
+	};
+	const pushCode = el => {
+		const cb = el.matches('code-block') ? el : el.querySelector('code-block');
+		if (!cb) return false;
+		const lang = (cb.querySelector('.header-formatted') || {innerText: ''}).innerText.trim();
+		const code = (cb.querySelector('pre') || {innerText: ''}).innerText;
+		if (lang || code.trim()) parts.push({k: 'code', lang: lang, code: code});
+		return true;
+	};
+	const blockTags = new Set(['p','h1','h2','h3','h4','h5','h6','ul','ol','table','blockquote','pre']);
+	const pushText = el => {
+		const tag = el.tagName.toLowerCase();
+		// só blocos de markdown contam como resposta; o resto (chips de
+		// follow-up, rodapés, containers) é enfeite da UI, não conteúdo
+		if (!blockTags.has(tag)) return;
+		let t = '';
+		if (/^h[1-6]$/.test(tag)) t = '#'.repeat(+tag[1]) + ' ' + el.innerText.trim();
+		else if (tag === 'ul' || tag === 'ol') {
+			t = [...el.children].map((li, i) =>
+				(tag === 'ol' ? (i + 1) + '. ' : '- ') + li.innerText.trim()).join('\n');
+		} else t = el.innerText.trim();
+		if (t) parts.push({k: 'text', text: t});
+	};
+	if (last) for (const child of last.children) {
+		if (isCodeHost(child)) {
+			if (!pushCode(child)) pushText(child);
+			continue;
+		}
+		// o texto mora dentro dos contêineres .markdown; os demais
+		// filhos diretos (rodapés, botões) não fazem parte da resposta
+		if ((child.className || '').toString().includes('markdown')) {
+			for (const block of child.children) {
+				if (isCodeHost(block)) {
+					if (!pushCode(block)) pushText(block);
+				} else {
+					pushText(block);
 				}
 			}
 		}
+	}
+	return parts;
+}`
+
+// genStateJS retrata a conversa: URL corrente, quantas respostas existem,
+// as parts da última resposta (extraídas por ESTRUTURA), texto atual no
+// editor, presença do botão "parar" (sinal de geração em andamento) e
+// presença de erro de geração na UI (botão de retry visível ou mensagem
+// de erro — permite abortar o loop de espera imediatamente em vez de
+// aguardar o timeout de 3min).
+func genStateJS() string {
+	return fmt.Sprintf(`JSON.stringify((() => {
+		const partsFn = %s;
+		const parts = partsFn(%q);
+		const editor = document.querySelector(%q);
+		const stop = document.querySelector(%q);
+		// Detecção de erro de geração: botão de retry ("Tentar novamente",
+		// "Retry") ou elementos de mensagem de erro visíveis na UI.
+		const errorEl = document.querySelector(
+			'button[aria-label*="Tentar novamente" i], button[aria-label*="Retry" i], ' +
+			'button[aria-label*="regenerate" i], ' +
+			'[class*="error-message"], [class*="generation-error"], ' +
+			'error-response, [data-test-id*="error"]'
+		);
 		return {
-			responses: responses.length,
+			url: location.href,
+			responses: document.querySelectorAll(%q).length,
 			parts: parts,
 			editorText: editor ? editor.innerText.trim() : '',
-			stopButton: !!stop
+			stopButton: !!stop,
+			generationError: !!(errorEl && !stop),
 		};
-	})())`, geminiSelectors.Response, geminiSelectors.Prompt, geminiSelectors.StopButton)
+	})())`, jsPartsFn, geminiSelectors.Response, geminiSelectors.Prompt, geminiSelectors.StopButton, geminiSelectors.Response)
+}
+
+// observerJS injeta o MutationObserver de streaming: a cada mutação (com
+// throttle de 100ms), monta o texto da última resposta com as MESMAS
+// regras do assembleText Go (fences de markdown, \n\n entre parts) — exceto
+// code blocks que começam com "{": podem ser chamadas de ferramenta em
+// formação, e essas NUNCA vazam como conteúdo (valem delta.tool_calls no
+// fim, não texto). O texto viaja por console.log com o marcador
+// __BIFROST__; o listener CDP (listenChunks) o encaminha ao canal da
+// geração corrente.
+func observerJS() string {
+	return fmt.Sprintf(`(() => {
+		if (window.__bifrostObs) { try { window.__bifrostObs.disconnect(); } catch (e) {} }
+		const partsFn = %s;
+		const F = String.fromCharCode(96).repeat(3);
+		const assemble = () => {
+			const parts = partsFn(%q);
+			let out = '';
+			for (const p of parts) {
+				if (p.k === 'code') {
+					const lang = (p.lang || '').trim();
+					const code = (p.code || '').replace(/^[\n]+|[\n]+$/g, '');
+					if (!lang && !code.trim()) continue;
+					if (code.trim().startsWith('{')) continue;
+					if (out) out += '\n\n';
+					out += F + lang + '\n' + code + '\n' + F;
+				} else {
+					const t = (p.text || '').trim();
+					if (!t) continue;
+					if (out) out += '\n\n';
+					out += t;
+				}
+			}
+			return out;
+		};
+		let last = 0, timer = null;
+		const fire = () => {
+			last = Date.now();
+			timer = null;
+			try {
+				console.log('__BIFROST__', JSON.stringify({
+					n: document.querySelectorAll(%q).length,
+					t: assemble(),
+				}));
+			} catch (e) {}
+		};
+		window.__bifrostObs = new MutationObserver(() => {
+			const now = Date.now();
+			if (now - last >= 100) { fire(); return; }
+			if (timer === null) timer = setTimeout(fire, 100 - (now - last));
+		});
+		window.__bifrostObs.observe(document.body, {childList: true, subtree: true, characterData: true});
+		return '';
+	})()`, jsPartsFn, geminiSelectors.Response, geminiSelectors.Response)
 }
 
 // genPart é um bloco da última resposta: parágrafo/lista/título ("text") ou
@@ -354,10 +573,12 @@ type genPart struct {
 }
 
 type genState struct {
-	Responses  int       `json:"responses"`
-	Parts      []genPart `json:"parts"`
-	EditorText string    `json:"editorText"`
-	StopButton bool      `json:"stopButton"`
+	URL             string    `json:"url"`
+	Responses       int       `json:"responses"`
+	Parts           []genPart `json:"parts"`
+	EditorText      string    `json:"editorText"`
+	StopButton      bool      `json:"stopButton"`
+	GenerationError bool      `json:"generationError"` // botão de retry ou erro de UI visível
 }
 
 // looksLikeToolCallJSON: conteúdo de code block com forma de chamada de
@@ -458,10 +679,9 @@ func modeByID(id string) *geminiMode {
 // Complete envia as mensagens ao Gemini e devolve o texto da última
 // resposta do modelo. Uma chamada por vez (mutex). ctx controla o timeout
 // de toda a operação — e, se morrer antes do fim (cliente desconectado),
-// aborta a espera. mode seleciona o modo da UI; nil mantém o modo
-// atual da conversa.
-func (g *Gemini) Complete(ctx context.Context, messages []Message, mode *geminiMode) (string, error) {
-	return g.complete(ctx, messages, mode, nil, nil)
+// aborta a espera. model seleciona o modo da UI.
+func (g *Gemini) Complete(ctx context.Context, messages []Message, model string) (string, error) {
+	return g.complete(ctx, messages, model, nil, nil)
 }
 
 // CompleteStream é o Complete com ganchos de streaming: onStart roda assim
@@ -471,11 +691,12 @@ func (g *Gemini) Complete(ctx context.Context, messages []Message, mode *geminiM
 // enquanto a geração corre — e pode devolver erro para ABORTAR a emissão
 // (o handler usa isso para detectar recusa de ferramenta antes de qualquer
 // byte chegar ao cliente e retentar com correção).
-func (g *Gemini) CompleteStream(ctx context.Context, messages []Message, mode *geminiMode, onStart func() error, onDelta func(string) error) (string, error) {
-	return g.complete(ctx, messages, mode, onStart, onDelta)
+func (g *Gemini) CompleteStream(ctx context.Context, messages []Message, model string, onStart func() error, onDelta func(string) error) (string, error) {
+	return g.complete(ctx, messages, model, onStart, onDelta)
 }
 
-func (g *Gemini) complete(ctx context.Context, messages []Message, mode *geminiMode, onStart func() error, onDelta func(string) error) (string, error) {
+func (g *Gemini) complete(ctx context.Context, messages []Message, model string, onStart func() error, onDelta func(string) error) (string, error) {
+	mode := modeByID(model)
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
@@ -510,20 +731,123 @@ func (g *Gemini) complete(ctx context.Context, messages []Message, mode *geminiM
 		return "", ErrGeminiNotLoggedIn
 	}
 
-	// Conversa nova quando a atual já tem respostas: cada requisição é
-	// independente — o cliente OpenAI reenvia o histórico completo, e
-	// acumular tudo na mesma conversa do Gemini duplicaria o contexto e
-	// desaceleraria as gerações.
-	if st, err := g.generationState(runCtx); err == nil && st.Responses > 0 {
-		if err := g.newChat(runCtx); err != nil {
-			slog.Warn("conversa nova falhou; seguindo na atual", "err", err)
-		} else {
-			slog.Info("fresh conversation")
+	// --- conversa aderente ---------------------------------------------
+	// O cliente reenvia o histórico completo a cada turno. Se ele é
+	// continuação do que já está na conversa do Gemini (prefixo casa,
+	// mesmo modelo, mesma contagem de respostas — ninguém digitou nada
+	// lá no meio), só o delta é digitado: o histórico permanece na
+	// conversa, cached do lado do Google, e o prompt de cada turno fica
+	// minúsculo em vez de crescer linearmente com o loop do agente.
+	base := historyBase(messages)
+	controls := controlMsgs(messages)
+
+	now, err := g.generationState(runCtx)
+	if err != nil {
+		return "", fmt.Errorf("ler estado da conversa: %w", err)
+	}
+
+	sticky := g.stickyOK && !g.dirty && g.lastModel == model &&
+		now.Responses == g.lastResponses && now.Responses > 0 &&
+		now.Responses <= maxStickyResponses &&
+		prefixMatch(g.lastBase, base)
+
+	// geração do turno anterior ainda correndo (cliente abortou o stream,
+	// a UI continuou): espera assentar antes de digitar — enviar durante
+	// a geração pode enfileirar ou perder a mensagem.
+	if sticky && now.StopButton {
+		if !g.waitForIdle(runCtx, 90*time.Second) {
+			slog.Warn("conversa aderente: geração anterior não assentou; conversa nova")
+			g.dirty = true
+			sticky = false
+		} else if st, serr := g.generationState(runCtx); serr == nil {
+			now = st
+			sticky = sticky && now.Responses == g.lastResponses
 		}
+	}
+
+	// devolveRespostaAtual: caminho de cache — a resposta pedida já está
+	// na conversa (reenvio idêntico do cliente, ou delta que não sobrou
+	// nada a dizer). Extrai a última resposta (esperando assentar se ainda
+	// gera) e devolve sem enviar nada.
+	devolveRespostaAtual := func() (string, bool) {
+		cacheCtx, ccancel := context.WithTimeout(runCtx, 90*time.Second)
+		defer ccancel()
+		text, werr := g.waitResponse(cacheCtx, now.Responses-1)
+		if werr != nil {
+			slog.Warn("conversa aderente: extração da resposta atual falhou; conversa nova", "err", werr)
+			g.dirty = true
+			sticky = false
+			if st, serr := g.generationState(runCtx); serr == nil {
+				now = st
+			}
+			return "", false
+		}
+		g.lastResponses = now.Responses
+		slog.Info("conversa aderente: resposta já na conversa devolvida", "chars", len(text))
+		return text, true
+	}
+
+	// reenvio idêntico sem correção → idempotência: a resposta já está lá.
+	if sticky && len(base) == len(g.lastBase) && !hasNudge(controls) {
+		if text, ok := devolveRespostaAtual(); ok {
+			return text, nil
+		}
+	}
+
+	var prompt string
+	if sticky {
+		// delta: o que o histórico ganhou desde o último turno, sem as
+		// respostas de TEXTO do assistant (o modelo já as emitiu — reenviar
+		// duplicaria o contexto), com os blocos de controle no fim (viés de
+		// recência).
+		delta := elideTextAssistants(base[len(g.lastBase):])
+		send := append(delta, controls...)
+		if p := SerializeMessages(send); strings.TrimSpace(p) != "" {
+			prompt = p
+			slog.Info("conversa aderente: reutilizando conversa",
+				"delta_msgs", len(send), "chars", len(prompt), "base_msgs", len(base))
+		}
+	}
+
+	// delta que não sobrou nada a dizer (só assistant no meio) → a resposta
+	// atual do modelo já cobre: devolve.
+	if sticky && prompt == "" {
+		if text, ok := devolveRespostaAtual(); ok {
+			return text, nil
+		}
+	}
+
+	if prompt == "" {
+		// conversa nova: cada requisição independente quando não há
+		// continuação — e conversas cumpridas reabrem para não desacelerar.
+		if now.Responses > 0 {
+			if err := g.newChat(runCtx); err != nil {
+				slog.Warn("conversa nova falhou; seguindo na atual", "err", err)
+			} else {
+				slog.Info("fresh conversation")
+			}
+		}
+		prompt = SerializeMessages(messages)
 	}
 
 	if err := g.ensureMode(runCtx, mode); err != nil {
 		return "", err
+	}
+
+	// streaming: registra o canal do observer e o injeta ANTES de digitar —
+	// a navegação (newChat) destrói o contexto JS da página, então a injeção
+	// vem depois de todas as navegações. Se falhar, streamResponse cai no
+	// caminho de polling (ch nil).
+	var streamCh chan streamChunk
+	if onDelta != nil {
+		streamCh = make(chan streamChunk, 64)
+		g.setStreamCh(streamCh)
+		defer g.setStreamCh(nil)
+		var discard string
+		if err := chromedp.Run(runCtx, chromedp.Evaluate(observerJS(), &discard)); err != nil {
+			slog.Warn("observer de streaming indisponível; fallback para polling", "err", err)
+			streamCh = nil
+		}
 	}
 
 	before, err := g.generationState(runCtx)
@@ -531,14 +855,22 @@ func (g *Gemini) complete(ctx context.Context, messages []Message, mode *geminiM
 		return "", fmt.Errorf("ler estado da conversa: %w", err)
 	}
 
-	prompt := SerializeMessages(messages)
 	if err := g.typePrompt(runCtx, prompt); err != nil {
 		return "", err
 	}
 	if err := g.submit(runCtx, before.Responses); err != nil {
 		return "", err
 	}
-	slog.Info("prompt submitted", "chars", len(prompt))
+	slog.Info("prompt submitted", "chars", len(prompt), "sticky", sticky)
+
+	// commit no envio: a conversa agora contém `base`; retratativas (nudge)
+	// enxergam esse estado e emendam a correção na MESMA conversa — o modelo
+	// vê a própria resposta ruim + a correção, sem re-enviar o histórico.
+	g.stickyOK = true
+	g.lastBase = base
+	g.lastModel = model
+	g.dirty = false
+	g.lastResponses = before.Responses + 1 // provisório; confirmado ao fim
 
 	if onStart != nil {
 		if err := onStart(); err != nil {
@@ -546,29 +878,64 @@ func (g *Gemini) complete(ctx context.Context, messages []Message, mode *geminiM
 		}
 	}
 
+	var text string
 	if onDelta != nil {
 		slog.Info("generation started (stream)")
-		text, err := g.streamResponse(runCtx, before.Responses, onDelta)
-		if err != nil {
-			return "", err
-		}
-		slog.Info("generation finished (stream)", "chars", len(text))
-		return text, nil
+		text, err = g.streamResponse(runCtx, before.Responses, streamCh, onDelta)
+	} else {
+		slog.Info("generation started")
+		text, err = g.waitResponse(runCtx, before.Responses)
 	}
-
-	slog.Info("generation started")
-	text, err := g.waitResponse(runCtx, before.Responses)
 	if err != nil {
+		// Estado da conversa após falha: se a resposta deste turno jamais
+		// apareceu, o conteúdo é incerto → conversa nova na próxima. Se
+		// apareceu (abort de streaming — o callback recusou — ou timeout de
+		// estabilidade), a conversa segue válida para o próximo turno.
+		probeCtx, pcancel := context.WithTimeout(g.ctx, 2*time.Second)
+		if st, serr := g.generationState(probeCtx); serr != nil || st.Responses <= before.Responses {
+			g.dirty = true
+		} else {
+			g.lastResponses = st.Responses
+		}
+		pcancel()
 		return "", err
 	}
-	slog.Info("generation finished")
-
-	slog.Info("response extracted", "chars", len(text))
+	if st, serr := g.generationState(runCtx); serr == nil {
+		g.lastResponses = st.Responses
+	}
+	slog.Info("generation finished", "chars", len(text), "sticky", sticky)
 	return text, nil
+}
+
+// commonPrefixLen devolve o tamanho do maior prefixo comum de a e b.
+func commonPrefixLen(a, b string) int {
+	n := 0
+	for n < len(a) && n < len(b) && a[n] == b[n] {
+		n++
+	}
+	return n
+}
+
+// waitForIdle espera a geração em andamento terminar (botão "parar" some).
+func (g *Gemini) waitForIdle(ctx context.Context, wait time.Duration) bool {
+	deadline := time.Now().Add(wait)
+	for time.Now().Before(deadline) {
+		if ctx.Err() != nil || g.ctx.Err() != nil {
+			return false
+		}
+		st, err := g.generationState(ctx)
+		if err == nil && !st.StopButton {
+			return true
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	return false
 }
 
 // typePrompt digita via Input.insertText — dispara os eventos de input que
 // o editor do Gemini espera e é instantâneo mesmo para prompts longos.
+// Após inserir, aguarda até 1,5s o Quill processar o texto (InsertText é
+// assíncrono em relação à renderização do Angular).
 func (g *Gemini) typePrompt(ctx context.Context, prompt string) error {
 	if err := chromedp.Run(ctx,
 		chromedp.Click(geminiSelectors.Prompt, chromedp.NodeVisible, chromedp.ByQuery),
@@ -578,14 +945,16 @@ func (g *Gemini) typePrompt(ctx context.Context, prompt string) error {
 	); err != nil {
 		return fmt.Errorf("%w: %v", ErrPromptNotFound, err)
 	}
-	st, err := g.generationState(ctx)
-	if err != nil {
-		return fmt.Errorf("conferir editor: %w", err)
+	// Poll: o Quill pode demorar alguns frames para refletir o texto no DOM.
+	deadline := time.Now().Add(1500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		st, err := g.generationState(ctx)
+		if err == nil && st.EditorText != "" {
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
-	if st.EditorText == "" {
-		return fmt.Errorf("%w: texto não apareceu no editor", ErrPromptNotFound)
-	}
-	return nil
+	return fmt.Errorf("%w: texto não apareceu no editor após 1,5s", ErrPromptNotFound)
 }
 
 // submit envia o que está no editor. Enter é o caminho primário (o Gemini
@@ -598,7 +967,7 @@ func (g *Gemini) submit(ctx context.Context, responsesBefore int) error {
 	); err != nil {
 		return fmt.Errorf("enviar prompt (Enter): %w", err)
 	}
-	if g.confirmSubmitted(ctx, responsesBefore, 4*time.Second) {
+	if g.confirmSubmitted(ctx, responsesBefore, 8*time.Second) {
 		return nil
 	}
 
@@ -606,20 +975,45 @@ func (g *Gemini) submit(ctx context.Context, responsesBefore int) error {
 	if err := chromedp.Run(ctx, chromedp.Click(geminiSelectors.Send, chromedp.NodeVisible, chromedp.ByQuery)); err != nil {
 		return fmt.Errorf("%w: nem Enter nem botão de envio funcionaram (%v)", ErrResponseNotFound, err)
 	}
-	if g.confirmSubmitted(ctx, responsesBefore, 4*time.Second) {
+	if g.confirmSubmitted(ctx, responsesBefore, 8*time.Second) {
 		return nil
 	}
 	return fmt.Errorf("%w: prompt não foi enviado", ErrResponseNotFound)
 }
 
-// confirmSubmitted espera o editor esvaziar (o editor reseta após enviar)
-// ou uma resposta nova aparecer.
+// confirmSubmitted espera o editor esvaziar (o editor reseta após enviar),
+// o botão "parar" aparecer (sinal de geração em andamento) ou uma resposta
+// nova aparecer. Timeout: 8s (aumentado de 4s para tolerar Gemini lento).
+//
+// Race condition crítica: o Gemini limpa o editor ANTES de criar o elemento
+// model-response — há uma janela de ~200–500ms onde nenhuma das condições
+// simples é verdadeira. Por isso, ao detectar editor vazio, aguardamos
+// 500ms extras antes de confirmar (evita falso negativo que causaria
+// duplo-envio via clique no botão de envio).
 func (g *Gemini) confirmSubmitted(ctx context.Context, responsesBefore int, wait time.Duration) bool {
 	deadline := time.Now().Add(wait)
+	var editorClearedAt time.Time
 	for time.Now().Before(deadline) {
 		st, err := g.generationState(ctx)
-		if err == nil && (st.EditorText == "" || st.Responses > responsesBefore) {
+		if err != nil {
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+		// Resposta nova ou geração iniciou (stop button): confirmado.
+		if st.Responses > responsesBefore || st.StopButton {
 			return true
+		}
+		// Editor vazio: pode ser a janela de race. Aguarda 500ms extra
+		// para o elemento de resposta aparecer antes de confirmar.
+		if st.EditorText == "" {
+			if editorClearedAt.IsZero() {
+				editorClearedAt = time.Now()
+			} else if time.Since(editorClearedAt) >= 500*time.Millisecond {
+				return true
+			}
+		} else {
+			// Editor voltou a ter texto? Reset (raro, mas protege).
+			editorClearedAt = time.Time{}
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
@@ -629,6 +1023,8 @@ func (g *Gemini) confirmSubmitted(ctx context.Context, responsesBefore int, wait
 // waitResponse aguarda a nova resposta terminar: texto presente, estável
 // por alguns polls seguidos e sem botão "parar" visível. Polling curto
 // (300ms) sobre estado real do DOM — nada de sleep fixo longo.
+// Aborta imediatamente se a UI do Gemini exibir um erro de geração
+// (botão "Tentar novamente" ou elemento de erro), evitando esperar 3min.
 func (g *Gemini) waitResponse(ctx context.Context, responsesBefore int) (string, error) {
 	const stableNeeded = 3
 	last := ""
@@ -641,16 +1037,23 @@ func (g *Gemini) waitResponse(ctx context.Context, responsesBefore int) (string,
 			return "", ErrBrowserClosed
 		}
 		st, err := g.generationState(ctx)
-		if err == nil && st.Responses > responsesBefore {
-			if text := assembleText(st.Parts, false); text != "" {
-				if text == last {
-					stable++
-				} else {
-					last = text
-					stable = 0
-				}
-				if stable >= stableNeeded && !st.StopButton {
-					return text, nil
+		if err == nil {
+			// Erro de UI detectado: aborta imediatamente.
+			if st.GenerationError {
+				slog.Warn("erro de geração detectado na UI do Gemini")
+				return "", ErrGenerationFailed
+			}
+			if st.Responses > responsesBefore {
+				if text := assembleText(st.Parts, false); text != "" {
+					if text == last {
+						stable++
+					} else {
+						last = text
+						stable = 0
+					}
+					if stable >= stableNeeded && !st.StopButton {
+						return text, nil
+					}
 				}
 			}
 		}
@@ -658,108 +1061,215 @@ func (g *Gemini) waitResponse(ctx context.Context, responsesBefore int) (string,
 	}
 }
 
-// streamResponse é o waitResponse do modo streaming, com emissão por
-// parts ESTÁVEIS: uma part só vai ao cliente quando existe há
-// stableNeeded polls sem mudar E já tem irmã depois dela — o Gemini
-// continua escrevendo um parágrafo depois de já criar o elemento
-// seguinte, então "ter irmã" sozinho não prova nada. A última part sai
-// apenas no fim, com o texto final. Part já emitida que muda (re-parse
-// raro) deixa o cliente com a versão anterior — o stream segue; truncar
-// a resposta seria pior. Fences tool_call NUNCA são emitidos como
-// conteúdo: são protocolo (o handler os traduz para delta.tool_calls).
-func (g *Gemini) streamResponse(ctx context.Context, responsesBefore int, onDelta func(string) error) (string, error) {
+// streamChunk é um empurrão do MutationObserver injetado na página: N =
+// total de respostas na tela quando o chunk nasceu (só interessam os da
+// resposta NOVA: N > responsesBefore), T = texto montado da última
+// resposta com as regras do assembleText (code blocks "{" retidos —
+// chamada de ferramenta em potencial nunca vaza como conteúdo).
+type streamChunk struct {
+	N int    `json:"n"`
+	T string `json:"t"`
+}
+
+// setStreamCh instala/desinstala o canal da geração corrente (o listener
+// CDP roda em outra goroutine e precisa de acesso sincronizado).
+func (g *Gemini) setStreamCh(ch chan streamChunk) {
+	g.streamMu.Lock()
+	g.streamCh = ch
+	g.streamMu.Unlock()
+}
+
+// listenChunks registra, UMA vez por aba, o listener de eventos CDP: os
+// console.log com o marcador __BIFROST__ (emitidos pelo observerJS) são
+// decodificados e encaminhados ao canal da geração corrente. Payload
+// truncado/corrompido é ignorado — o polling de estado cobre o resto.
+func (g *Gemini) listenChunks() {
+	chromedp.ListenTarget(g.ctx, func(ev any) {
+		ce, ok := ev.(*runtime.EventConsoleAPICalled)
+		if !ok || len(ce.Args) < 2 {
+			return
+		}
+		var marker string
+		if len(ce.Args[0].Value) == 0 || json.Unmarshal(ce.Args[0].Value, &marker) != nil || marker != "__BIFROST__" {
+			return
+		}
+		var payload string
+		if json.Unmarshal(ce.Args[1].Value, &payload) != nil {
+			return
+		}
+		var ck streamChunk
+		if json.Unmarshal([]byte(payload), &ck) != nil {
+			return
+		}
+		g.streamMu.Lock()
+		ch := g.streamCh
+		g.streamMu.Unlock()
+		if ch == nil {
+			return
+		}
+		select {
+		case ch <- ck:
+		default: // cheio: o polling cobre o que faltar
+		}
+	})
+}
+
+// streamResponse emite a resposta ENQUANTO ela nasce: o MutationObserver
+// injetado (observerJS) empurra o texto montado da resposta nova a cada
+// ~100ms via console → listener CDP → canal; cada crescimento vira delta
+// imediato, sem esperar estabilidade — o primeiro token chega ao cliente
+// assim que o primeiro parágrafo começa, não quando o segundo existe.
+//
+// O polling de 300ms permanece para: detecção de erro de UI, TÉRMINO
+// (texto completo estável + botão parar ausente) e emissão final do que o
+// observer reteve (code blocks "{": chamadas de ferramenta em potencial —
+// o handler os traduz para delta.tool_calls, nunca conteúdo).
+//
+// Se o observer não entregar nada (injeção falhou, CDP mudo), o caminho
+// antigo assume após a carência: emissão por parts ESTÁVEIS (part só sai
+// quando estável há 3 polls e já tem irmã — o Gemini continua escrevendo
+// um parágrafo depois de criar o elemento seguinte).
+func (g *Gemini) streamResponse(ctx context.Context, responsesBefore int, ch chan streamChunk, onDelta func(string) error) (string, error) {
 	const stableNeeded = 3
-	var prev []genPart  // parts do poll anterior
-	var stab []int      // polls consecutivos sem mudar, por índice
-	emitted := 0        // quantas parts já foram ao cliente
-	sentText := ""      // texto acumulado enviado (com as junções \n\n)
-	lastFull := ""      // texto completo do poll anterior
-	stableFull := 0     // polls consecutivos com o texto completo igual
-	morphWarned := false
+	const observerGrace = 2500 * time.Millisecond
+
+	sentText := "" // texto já enviado ao cliente (base dos deltas)
+	obsSeen := false
+	start := time.Now()
+
+	// fallback por parts estáveis (observer mudo)
+	var prev []genPart
+	var stab []int
+	emitted := 0
+
+	lastFull := ""
+	stableFull := 0
+
+	emit := func(delta string) error {
+		if delta == "" {
+			return nil
+		}
+		if err := onDelta(delta); err != nil {
+			return fmt.Errorf("emissão abortada pelo callback: %w", err)
+		}
+		sentText += delta
+		return nil
+	}
+
+	timer := time.NewTimer(300 * time.Millisecond)
+	defer timer.Stop()
 	for {
-		if err := ctx.Err(); err != nil {
-			return "", fmt.Errorf("%w: %v", ErrGenerationTimeout, err)
-		}
-		if g.ctx.Err() != nil {
+		select {
+		case <-ctx.Done():
+			return "", fmt.Errorf("%w: %v", ErrGenerationTimeout, ctx.Err())
+		case <-g.ctx.Done():
 			return "", ErrBrowserClosed
-		}
-		st, err := g.generationState(ctx)
-		if err == nil && st.Responses > responsesBefore {
-			// estabilidade por part: contador por índice que zera quando a
-			// part muda (cresce, é re-parseada, some)
-			cur := st.Parts
-			nextStab := make([]int, len(cur))
-			for i := range cur {
-				if i < len(prev) && prev[i] == cur[i] {
-					nextStab[i] = stab[i] + 1
+		case c := <-ch:
+			obsSeen = true
+			// só a resposta NOVA interessa (chunks da resposta anterior
+			// re-renderizando são ruído)
+			if c.N > responsesBefore && strings.HasPrefix(c.T, sentText) && len(c.T) > len(sentText) {
+				if err := emit(c.T[len(sentText):]); err != nil {
+					return "", err
 				}
 			}
-			prev, stab = cur, nextStab
-
-			// prefixo emitível: parts não-últimas estáveis há stableNeeded
-			emitCount := 0
-			for i := 0; i+1 < len(cur) && stab[i] >= stableNeeded; i++ {
-				emitCount = i + 1
-			}
-			if emitCount > emitted {
-				delta := assembleText(cur[emitted:emitCount], true)
-				if sentText != "" && delta != "" {
-					delta = "\n\n" + delta
+		case <-timer.C:
+			st, err := g.generationState(ctx)
+			if err == nil {
+				// Erro de UI detectado: aborta imediatamente.
+				if st.GenerationError {
+					slog.Warn("erro de geração detectado na UI do Gemini (stream)")
+					return "", ErrGenerationFailed
 				}
-				if delta != "" {
-					if err := onDelta(delta); err != nil {
-						return "", fmt.Errorf("emissão abortada pelo callback: %w", err)
-					}
-					sentText += delta
-				}
-				emitted = emitCount
-			} else {
-				// part já emitida que voltou a mudar: cliente mantém a
-				// versão anterior; emissão retoma quando estabilizar
-				morphed := false
-				for i := 0; i < emitted && i < len(stab); i++ {
-					if stab[i] < stableNeeded {
-						morphed = true
-						break
-					}
-				}
-				if morphed && !morphWarned {
-					morphWarned = true
-					slog.Warn("stream: part já emitida mudou; cliente mantém a versão anterior")
-				}
-			}
-
-			// fim: texto completo estável + botão parar ausente
-			if full := assembleText(st.Parts, false); full != "" {
-				if full == lastFull {
-					stableFull++
-				} else {
-					lastFull = full
-					stableFull = 0
-				}
-				if stableFull >= stableNeeded && !st.StopButton {
-					if len(st.Parts) > emitted {
-						delta := assembleText(st.Parts[emitted:], true)
-						if sentText != "" && delta != "" {
-							delta = "\n\n" + delta
+				if st.Responses > responsesBefore {
+					// fim: texto completo estável + botão parar ausente
+					if full := assembleText(st.Parts, false); full != "" {
+						if full == lastFull {
+							stableFull++
+						} else {
+							lastFull = full
+							stableFull = 0
 						}
-						if delta != "" {
-							if err := onDelta(delta); err != nil {
-								return "", fmt.Errorf("emissão abortada pelo callback: %w", err)
+						if stableFull >= stableNeeded && !st.StopButton {
+							if obsSeen {
+								// emissão final: o que o observer reteu além do
+								// enviado (blocos "{", cauda não transmitida)
+								finalNoTool := assembleText(st.Parts, true)
+								switch {
+								case strings.HasPrefix(finalNoTool, sentText):
+									if err := emit(finalNoTool[len(sentText):]); err != nil {
+										return "", err
+									}
+								case sentText == "":
+									if err := emit(finalNoTool); err != nil {
+										return "", err
+									}
+								default:
+									// re-parse da UI mudou texto já enviado: emenda
+									// a partir do maior prefixo comum — o cliente
+									// pode ver uma ementa no ponto da mudança, mas
+									// nunca perde o conteúdo que veio depois dela
+									n := commonPrefixLen(sentText, finalNoTool)
+									slog.Warn("stream: texto final divergiu do emitido; emendando a partir da divergência",
+										"sent", len(sentText), "final", len(finalNoTool), "divergence", n)
+									if err := emit(finalNoTool[n:]); err != nil {
+										return "", err
+									}
+								}
+							} else if len(st.Parts) > emitted {
+								// fallback: emite as parts restantes
+								delta := assembleText(st.Parts[emitted:], true)
+								if sentText != "" && delta != "" {
+									delta = "\n\n" + delta
+								}
+								if err := emit(delta); err != nil {
+									return "", err
+								}
+							}
+							return full, nil
+						}
+					}
+
+					// fallback (observer mudo, após a carência): emissão por
+					// parts estáveis — part só sai estável há 3 polls E com
+					// irmã depois dela
+					if !obsSeen && time.Since(start) > observerGrace {
+						cur := st.Parts
+						nextStab := make([]int, len(cur))
+						for i := range cur {
+							if i < len(prev) && prev[i] == cur[i] {
+								nextStab[i] = stab[i] + 1
 							}
 						}
+						prev, stab = cur, nextStab
+
+						emitCount := 0
+						for i := 0; i+1 < len(cur) && stab[i] >= stableNeeded; i++ {
+							emitCount = i + 1
+						}
+						if emitCount > emitted {
+							delta := assembleText(cur[emitted:emitCount], true)
+							if sentText != "" && delta != "" {
+								delta = "\n\n" + delta
+							}
+							if err := emit(delta); err != nil {
+								return "", err
+							}
+							emitted = emitCount
+						}
 					}
-					return full, nil
 				}
 			}
+			timer.Reset(300 * time.Millisecond)
 		}
-		time.Sleep(300 * time.Millisecond)
 	}
 }
 
 // ensureMode garante que o seletor de modo esteja no modo pedido (nil =
 // não mexer). Troca só quando necessário: ler o aria-label do botão custa
-// um evaluate.
+// um evaluate. Tenta a sequência (abrir menu → aguardar itens → clicar)
+// até 3 vezes antes de desistir — sleep fixo substituído por poll real,
+// que tolera headless e carregamentos lentos.
 func (g *Gemini) ensureMode(ctx context.Context, mode *geminiMode) error {
 	if mode == nil {
 		return nil
@@ -786,48 +1296,86 @@ func (g *Gemini) ensureMode(ctx context.Context, mode *geminiMode) error {
 	}
 
 	slog.Info("switching mode", "to", mode.MenuItem)
-	var jsErr string
-	err := chromedp.Run(ctx,
-		// abre o menu de modos
-		chromedp.Evaluate(fmt.Sprintf(`(() => {
+
+	// menuItemsVisible: poll real até gem-menu-item estar no DOM.
+	// Substitui sleep fixo — mais rápido em desktop, tolera headless lento.
+	menuItemsVisible := func() bool {
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			var has string
+			if err := chromedp.Run(ctx, chromedp.Evaluate(
+				fmt.Sprintf(`document.querySelector(%q) ? '1' : ''`, geminiSelectors.ModeItem), &has,
+			)); err == nil && has == "1" {
+				return true
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		return false
+	}
+
+	// trySwitch: uma tentativa completa (abrir menu → clicar item).
+	trySwitch := func() (string, error) {
+		var jsErr string
+		if err := chromedp.Run(ctx, chromedp.Evaluate(fmt.Sprintf(`(() => {
 			const btn = document.querySelector(%q);
 			if (!btn) return 'seletor de modo não encontrado';
 			btn.click();
 			return '';
-		})()`, geminiSelectors.ModeSwitcher), &jsErr),
-		chromedp.Sleep(400*time.Millisecond),
-		// clica o item cujo texto contém o modo pedido
-		chromedp.Evaluate(fmt.Sprintf(`(() => {
+		})()`, geminiSelectors.ModeSwitcher), &jsErr)); err != nil {
+			return "", err
+		}
+		if jsErr != "" {
+			return jsErr, nil
+		}
+		if !menuItemsVisible() {
+			// menu não abriu — fecha qualquer overlay e tenta na próxima iteração
+			_ = chromedp.Run(ctx, chromedp.Evaluate(fmt.Sprintf(`(() => {
+				const btn = document.querySelector(%q); if (btn) btn.click();
+			})()`, geminiSelectors.ModeSwitcher), &jsErr))
+			return "menu não abriu", nil
+		}
+		if err := chromedp.Run(ctx, chromedp.Evaluate(fmt.Sprintf(`(() => {
 			const items = [...document.querySelectorAll(%q)];
 			const el = items.find(el => el.textContent.includes(%q));
 			if (!el) return 'modo não encontrado no menu: %s';
 			el.click();
 			return '';
-		})()`, geminiSelectors.ModeItem, mode.MenuItem, mode.MenuItem), &jsErr),
-	)
-	if err != nil {
-		return fmt.Errorf("trocar modo: %w", err)
-	}
-	if jsErr != "" {
-		return fmt.Errorf("trocar modo: %s", jsErr)
+		})()`, geminiSelectors.ModeItem, mode.MenuItem, mode.MenuItem), &jsErr)); err != nil {
+			return "", err
+		}
+		return jsErr, nil
 	}
 
-	// confirma: o aria-label do botão passa a terminar com o marcador do modo
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if hasMode() {
-			slog.Info("mode switched", "mode", mode.MenuItem)
-			return nil
+	const maxAttempts = 3
+	var lastJSErr string
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			slog.Warn("mode switch retry", "attempt", attempt+1, "reason", lastJSErr)
+			time.Sleep(500 * time.Millisecond)
 		}
-		time.Sleep(250 * time.Millisecond)
+		var err error
+		lastJSErr, err = trySwitch()
+		if err != nil {
+			return fmt.Errorf("trocar modo: %w", err)
+		}
+		// confirma: o aria-label passa a terminar com o marcador do modo
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if hasMode() {
+				slog.Info("mode switched", "mode", mode.MenuItem, "attempt", attempt+1)
+				return nil
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
 	}
+
 	// diagnóstico: o que o rótulo de fato diz?
 	var curLabel string
 	_ = chromedp.Run(ctx, chromedp.Evaluate(fmt.Sprintf(`(() => {
 		const btn = document.querySelector(%q);
 		return btn ? (btn.getAttribute('aria-label') || '') : '';
 	})()`, geminiSelectors.ModeSwitcher), &curLabel))
-	return fmt.Errorf("troca para o modo %q não confirmou (rótulo atual: %q)", mode.MenuItem, curLabel)
+	return fmt.Errorf("troca para o modo %q não confirmou após %d tentativas (rótulo atual: %q)", mode.MenuItem, maxAttempts, curLabel)
 }
 
 // newChat zera a conversa. Botão primeiro (sem reload); navegar ao /app é
@@ -841,7 +1389,7 @@ func (g *Gemini) newChat(ctx context.Context) error {
 		return '';
 	})()`, geminiSelectors.NewChat), &jsErr)); err != nil || jsErr != "" {
 		slog.Warn("botão de nova conversa indisponível; navegando", "err", err, "js", jsErr)
-	} else if g.confirmFresh(ctx, 2*time.Second) {
+	} else if g.confirmFresh(ctx, 3*time.Second) {
 		return nil
 	} else {
 		slog.Warn("botão de nova conversa não confirmou; navegando")
@@ -850,18 +1398,33 @@ func (g *Gemini) newChat(ctx context.Context) error {
 	if err := chromedp.Run(ctx, chromedp.Navigate(geminiSelectors.URL)); err != nil {
 		return fmt.Errorf("navegar para conversa nova: %w", err)
 	}
-	if g.confirmFresh(ctx, 5*time.Second) {
+	if g.confirmFresh(ctx, 8*time.Second) {
 		return nil
 	}
 	return errors.New("conversa nova não confirmou")
 }
 
-// confirmFresh espera a conversa zerar (sem respostas).
+// confirmFresh espera a conversa zerar (sem respostas) E o prompt box
+// estar presente no DOM — o Quill pode demorar até 2s após a navegação
+// para aparecer; typePrompt não pode rodar antes disso.
 func (g *Gemini) confirmFresh(ctx context.Context, wait time.Duration) bool {
 	deadline := time.Now().Add(wait)
 	for time.Now().Before(deadline) {
 		st, err := g.generationState(ctx)
-		if err == nil && st.Responses == 0 {
+		if err != nil {
+			time.Sleep(250 * time.Millisecond)
+			continue
+		}
+		if st.Responses > 0 {
+			// ainda mostrando conversa anterior
+			time.Sleep(250 * time.Millisecond)
+			continue
+		}
+		// Responses == 0: confirma que o prompt box existe (Quill pronto).
+		var hasPrompt string
+		if err := chromedp.Run(ctx, chromedp.Evaluate(
+			fmt.Sprintf(`document.querySelector(%q) ? '1' : ''`, geminiSelectors.Prompt), &hasPrompt,
+		)); err == nil && hasPrompt == "1" {
 			return true
 		}
 		time.Sleep(250 * time.Millisecond)

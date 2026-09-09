@@ -4,12 +4,17 @@ services:
     image: bifrost:latest
     container_name: bifrost
     ports:
-      - "8081:8080" # 8080 do host está ocupado (Alexandria)
+      - "8081:8080"
     volumes:
       - ./data/chrome-profile:/data/chrome-profile
-    shm_size: "1gb" # Chrome precisa de mais que os 64MB default
+      - /tmp/.X11-unix:/tmp/.X11-unix  # login headed via painel
+    environment:
+      DISPLAY: "${DISPLAY:-:0}"         # herda o display do host para o login
+      BIFROST_NO_SANDBOX: "true"        # obrigatório em container Docker
+      BIFROST_PASSWORD_STORE: "basic"   # cookie encryption sem gnome-keyring
+      # BIFROST_API_KEY: "troque-por-uma-chave-bem-longa"
+      # BIFROST_LOG: "info"
+      # BIFROST_MODEL: "gemini-web-flash"
+      # BIFROST_POOL_SIZE: "3"          # Permite N requisições paralelas
+    shm_size: "1gb"   # Chrome precisa de mais que os 64MB default de container
     restart: unless-stopped
-    # environment:
-    #   BIFROST_API_KEY: troque-por-uma-chave-bem-longa
-    #   BIFROST_LOG: info
-    #   BIFROST_MODEL: gemini-web-flash
