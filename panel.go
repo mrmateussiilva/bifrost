@@ -33,6 +33,7 @@ type reqRecord struct {
 	Tools        int       `json:"tools"`
 	Prompt       string    `json:"prompt"`
 	Status       string    `json:"status"`
+	Err          string    `json:"error,omitempty"` // mensagem do erro (status != ok/tool_calls)
 	ToolCalls    int       `json:"tool_calls"`
 	Chars        int       `json:"chars"`
 	Retries      int       `json:"retries"`
@@ -650,8 +651,11 @@ async function tick(){
       const color = r.status==='ok'?'var(--ok)':r.status==='tool_calls'?'var(--purple)':'var(--err)';
       const pc = r.full_prompt||'';
       const rc = r.full_response||'';
+      const errBox = r.error
+        ? '<div style="margin-bottom:12px;padding:12px 14px;border:1px solid var(--err);background:var(--err-bg);border-radius:8px;color:var(--err);font:12px/1.6 ui-monospace,\'SF Mono\',Menlo,monospace;white-space:pre-wrap;word-break:break-word">'+esc(r.error)+'</div>'
+        : '';
       const detailRow = '<tr class="detail-row" id="det-'+r.id+'" style="display:'+(isExp?'':'none')+'">'
-        +'<td colspan="9"><div class="detail-inner"><div class="detail-grid">'
+        +'<td colspan="9"><div class="detail-inner">'+errBox+'<div class="detail-grid">'
         +'<div><div class="detail-label">Prompt enviado</div>'
         +'<div class="detail-content'+(pc?'':' empty')+'">'+(pc?esc(pc):'(não disponível)')+'</div></div>'
         +'<div><div class="detail-label">Resposta do Gemini</div>'

@@ -240,6 +240,11 @@ var (
 // o histórico completo é reenviado numa conversa nova.
 const maxStickyResponses = 30
 
+// stickyProtoReminder substitui o protocolo completo de tools em turnos
+// aderentes com o MESMO toolset: o protocolo inteiro já está no início da
+// conversa; re-digitar 28 schemas (~60KB) por turno só desperdiça tempo.
+const stickyProtoReminder = `LEMBRETE DE PROTOCOLO: as ferramentas declaradas no início desta conversa seguem valendo, com as mesmas regras e schemas. Chamada = um code block contendo APENAS o JSON {"name": ..., "arguments": {...}}; uma chamada por bloco. Resultados chegam como blocos [TOOL nome_da_ferramenta]. Nunca repita chamada cujo resultado já chegou; nunca exiba conteúdo de arquivo como texto — chame a ferramenta. Se nenhuma ferramenta cobre a tarefa, responda em markdown normal.`
+
 // Gemini adapta a interface web: ctx é o contexto chromedp da aba (dono: o
 // Browser) e mu garante uma interação por vez — duas prompts simultâneas na
 // mesma aba seria caos.
@@ -257,6 +262,7 @@ type Gemini struct {
 	lastBase      []Message // histórico (sem blocos de controle) presente na conversa
 	lastModel     string    // modelo do último turno (mudou → conversa nova)
 	lastResponses int       // contagem de respostas após o último turno
+	lastProto     string    // protocolo de tools do turno que abriu a conversa (normalizado)
 	dirty         bool      // último turno falhou com estado incerto: força conversa nova
 
 	// Streaming: canal do MutationObserver (listener CDP → streamResponse).
@@ -741,6 +747,16 @@ func (g *Gemini) complete(ctx context.Context, messages []Message, model string,
 	base := historyBase(messages)
 	controls := controlMsgs(messages)
 
+	// proto: o protocolo de tools normalizado (sem a instrução multi-turn,
+	// que entra e sai conforme o histórico) — identifica o toolset do
+	// turno para decidir entre protocolo inteiro e lembrete compacto.
+	proto := ""
+	for _, m := range controls {
+		if m.Control {
+			proto = strings.Replace(m.Content, "\n"+multiTurnToolInstruction, "", 1)
+		}
+	}
+
 	now, err := g.generationState(runCtx)
 	if err != nil {
 		return "", fmt.Errorf("ler estado da conversa: %w", err)
@@ -799,13 +815,29 @@ func (g *Gemini) complete(ctx context.Context, messages []Message, model string,
 		// delta: o que o histórico ganhou desde o último turno, sem as
 		// respostas de TEXTO do assistant (o modelo já as emitiu — reenviar
 		// duplicaria o contexto), com os blocos de controle no fim (viés de
-		// recência).
+		// recência). Toolset idêntico ao do turno que abriu a conversa →
+		// lembrete compacto no lugar do protocolo inteiro (com 28 tools,
+		// ~60KB poupados por turno; o protocolo completo já está na conversa).
 		delta := elideTextAssistants(base[len(g.lastBase):])
-		send := append(delta, controls...)
+		send := make([]Message, 0, len(delta)+len(controls))
+		send = append(send, delta...)
+		compactProto := false
+		for _, m := range controls {
+			if m.Control && proto != "" && proto == g.lastProto {
+				compactProto = true
+				compact := stickyProtoReminder
+				if strings.Contains(m.Content, multiTurnToolInstruction) {
+					compact += "\n" + multiTurnToolInstruction
+				}
+				send = append(send, Message{Role: "system", Content: compact, Control: true})
+				continue
+			}
+			send = append(send, m)
+		}
 		if p := SerializeMessages(send); strings.TrimSpace(p) != "" {
 			prompt = p
 			slog.Info("conversa aderente: reutilizando conversa",
-				"delta_msgs", len(send), "chars", len(prompt), "base_msgs", len(base))
+				"delta_msgs", len(send), "chars", len(prompt), "base_msgs", len(base), "proto_compact", compactProto)
 		}
 	}
 
@@ -871,6 +903,9 @@ func (g *Gemini) complete(ctx context.Context, messages []Message, model string,
 	g.lastModel = model
 	g.dirty = false
 	g.lastResponses = before.Responses + 1 // provisório; confirmado ao fim
+	if proto != "" {
+		g.lastProto = proto
+	}
 
 	if onStart != nil {
 		if err := onStart(); err != nil {
@@ -1268,8 +1303,11 @@ func (g *Gemini) streamResponse(ctx context.Context, responsesBefore int, ch cha
 // ensureMode garante que o seletor de modo esteja no modo pedido (nil =
 // não mexer). Troca só quando necessário: ler o aria-label do botão custa
 // um evaluate. Tenta a sequência (abrir menu → aguardar itens → clicar)
-// até 3 vezes antes de desistir — sleep fixo substituído por poll real,
-// que tolera headless e carregamentos lentos.
+// até 3 vezes. Em páginas de conversa longa o popover pode levar vários
+// segundos para renderizar em headless — os polls são longos o bastante
+// para isso. Ao falhar, DEGRADA em vez de matar o request: a resposta
+// vem do modo atual (um erro 500 travaria o loop do agente inteiro; uma
+// resposta do modelo errado, não).
 func (g *Gemini) ensureMode(ctx context.Context, mode *geminiMode) error {
 	if mode == nil {
 		return nil
@@ -1297,10 +1335,11 @@ func (g *Gemini) ensureMode(ctx context.Context, mode *geminiMode) error {
 
 	slog.Info("switching mode", "to", mode.MenuItem)
 
-	// menuItemsVisible: poll real até gem-menu-item estar no DOM.
-	// Substitui sleep fixo — mais rápido em desktop, tolera headless lento.
+	// menuItemsVisible: poll real até gem-menu-item estar no DOM. 6s: em
+	// conversas longas a renderização do popover em headless é lenta — 2s
+	// dava falso negativo ("menu não abriu") e matava o request.
 	menuItemsVisible := func() bool {
-		deadline := time.Now().Add(2 * time.Second)
+		deadline := time.Now().Add(6 * time.Second)
 		for time.Now().Before(deadline) {
 			var has string
 			if err := chromedp.Run(ctx, chromedp.Evaluate(
@@ -1308,12 +1347,14 @@ func (g *Gemini) ensureMode(ctx context.Context, mode *geminiMode) error {
 			)); err == nil && has == "1" {
 				return true
 			}
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(150 * time.Millisecond)
 		}
 		return false
 	}
 
-	// trySwitch: uma tentativa completa (abrir menu → clicar item).
+	// trySwitch: uma tentativa completa (abrir menu → clicar item). O item
+	// pode ser pai de submenu na UI nova — clica o filho homônimo aninhado
+	// quando existir.
 	trySwitch := func() (string, error) {
 		var jsErr string
 		if err := chromedp.Run(ctx, chromedp.Evaluate(fmt.Sprintf(`(() => {
@@ -1335,12 +1376,22 @@ func (g *Gemini) ensureMode(ctx context.Context, mode *geminiMode) error {
 			return "menu não abriu", nil
 		}
 		if err := chromedp.Run(ctx, chromedp.Evaluate(fmt.Sprintf(`(() => {
+			const want = %q;
 			const items = [...document.querySelectorAll(%q)];
-			const el = items.find(el => el.textContent.includes(%q));
-			if (!el) return 'modo não encontrado no menu: %s';
-			el.click();
+			const exact = items.find(el => (el.innerText || '').trim().startsWith(want));
+			const el = exact || items.find(el => el.textContent.includes(want));
+			if (!el) return 'modo não encontrado no menu: ' + want;
+			// item desabilitado (limite de uso da conta, p.ex.): é
+			// determinístico — inútil retentar; o motivo (com o reset do
+			// limite) vai na mensagem
+			if (el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true') {
+				const detail = (el.innerText || '').split('\n').slice(1).join(' ').trim();
+				return 'modo ' + want + ' indisponível' + (detail ? ': ' + detail : '');
+			}
+			const nested = [...el.querySelectorAll(%q)].find(c => c.textContent.includes(want));
+			(nested || el).click();
 			return '';
-		})()`, geminiSelectors.ModeItem, mode.MenuItem, mode.MenuItem), &jsErr)); err != nil {
+		})()`, mode.MenuItem, geminiSelectors.ModeItem, geminiSelectors.ModeItem), &jsErr)); err != nil {
 			return "", err
 		}
 		return jsErr, nil
@@ -1358,8 +1409,12 @@ func (g *Gemini) ensureMode(ctx context.Context, mode *geminiMode) error {
 		if err != nil {
 			return fmt.Errorf("trocar modo: %w", err)
 		}
+		// desabilitado é determinístico (limite de uso): sem retentativa
+		if strings.Contains(lastJSErr, "indisponível") {
+			break
+		}
 		// confirma: o aria-label passa a terminar com o marcador do modo
-		deadline := time.Now().Add(5 * time.Second)
+		deadline := time.Now().Add(6 * time.Second)
 		for time.Now().Before(deadline) {
 			if hasMode() {
 				slog.Info("mode switched", "mode", mode.MenuItem, "attempt", attempt+1)
@@ -1375,7 +1430,11 @@ func (g *Gemini) ensureMode(ctx context.Context, mode *geminiMode) error {
 		const btn = document.querySelector(%q);
 		return btn ? (btn.getAttribute('aria-label') || '') : '';
 	})()`, geminiSelectors.ModeSwitcher), &curLabel))
-	return fmt.Errorf("troca para o modo %q não confirmou após %d tentativas (rótulo atual: %q)", mode.MenuItem, maxAttempts, curLabel)
+	// degradação graciosa: segue no modo atual — o request responde em vez
+	// de falhar. O rótulo vai ao log (e ao painel via tee) para diagnóstico.
+	slog.Warn("mode switch falhou; seguindo no modo atual",
+		"want", mode.MenuItem, "attempts", maxAttempts, "label", curLabel, "last_err", lastJSErr)
+	return nil
 }
 
 // newChat zera a conversa. Botão primeiro (sem reload); navegar ao /app é

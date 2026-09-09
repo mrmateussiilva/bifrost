@@ -31,6 +31,18 @@ func headlessFlag(headless bool) any {
 	return false
 }
 
+// chromeErrLog filtra o ruído do chromedp: eventos DOM sem handler (ex.:
+// EventTopLayerElementsUpdated, disparado a cada popover da UI do Gemini)
+// viravam level=INFO no slog (via ponte log→slog) e poluíam log e painel;
+// erros reais seguem como slog Warn.
+func chromeErrLog(format string, v ...any) {
+	msg := fmt.Sprintf(format, v...)
+	if strings.Contains(msg, "unhandled node event") {
+		return
+	}
+	slog.Warn("chromedp", "err", msg)
+}
+
 // StartBrowser lança o Chromium com --user-data-dir no profile da config. O
 // profile persiste entre execuções — é ele que guarda o login do Gemini.
 func StartBrowser(ctx context.Context, cfg Config) (*Browser, error) {
@@ -75,7 +87,7 @@ func StartBrowser(ctx context.Context, cfg Config) (*Browser, error) {
 
 	tryStart := func() (*Browser, error) {
 		allocCtx, cancelAlloc := chromedp.NewExecAllocator(ctx, opts...)
-		browserCtx, cancelBrowser := chromedp.NewContext(allocCtx)
+		browserCtx, cancelBrowser := chromedp.NewContext(allocCtx, chromedp.WithErrorf(chromeErrLog))
 
 		if err := chromedp.Run(browserCtx, chromedp.Navigate("about:blank")); err != nil {
 			cancelBrowser()

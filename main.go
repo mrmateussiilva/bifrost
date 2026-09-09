@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -96,6 +97,8 @@ func run(ctx context.Context, cfg Config, args []string) error {
 		return runInspect(ctx, cfg)
 	case "modes":
 		return runModes(ctx, cfg)
+	case "probe-menu":
+		return runProbeMenu(ctx, cfg)
 	case "test":
 		if len(args) < 2 {
 			return errors.New(`uso: bifrost test "seu prompt"`)
@@ -333,6 +336,120 @@ func runServe(ctx context.Context, cfg Config) error {
 	}
 }
 
+// runProbeMenu diagnostica o seletor de modos: abre o menu e despeja a
+// estrutura real dos itens (tags, roles, atributos, HTML truncado) +
+// tenta um clique com sequência completa de eventos de ponteiro e lê o
+// rótulo resultante. É a ferramenta para quando `modes` para de
+// confirmar trocas — a UI muda, este comando mostra o que virou.
+func runProbeMenu(ctx context.Context, cfg Config) error {
+	browser, err := StartBrowser(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer browser.Close()
+
+	if err := OpenGemini(browser.BootCtx); err != nil {
+		return err
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		state, _, err := GeminiState(browser.BootCtx)
+		if err == nil && state == stateLoggedIn {
+			break
+		}
+		if time.Now().After(deadline) {
+			return errors.New("sem sessão logada — rode `bifrost login` primeiro")
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+
+	// abre o menu
+	var dummy string
+	if err := chromedp.Run(browser.BootCtx,
+		chromedp.Evaluate(`(() => {
+			const btn = document.querySelector('bard-mode-switcher button');
+			if (!btn) return 'seletor não encontrado';
+			btn.click();
+			return '';
+		})()`, &dummy),
+		chromedp.Sleep(800*time.Millisecond),
+	); err != nil {
+		return fmt.Errorf("abrir menu: %w", err)
+	}
+
+	// despeja a estrutura: cada gem-menu-item com tag/role/aria/HTML, os
+	// containers de menu no top layer e os candidatos a item clicável
+	dumpJS := `JSON.stringify((() => {
+		const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+		const items = [...document.querySelectorAll('gem-menu-item')].map(el => ({
+			tag: el.tagName.toLowerCase(),
+			role: el.getAttribute('role'),
+			aria: norm(el.getAttribute('aria-label')),
+			disabled: el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true',
+			text: norm(el.innerText).slice(0, 60),
+			kids: [...el.children].map(c => c.tagName.toLowerCase() + (c.getAttribute('role') ? ':' + c.getAttribute('role') : '')).slice(0, 6),
+			html: norm(el.outerHTML).slice(0, 260),
+		}));
+		const roles = [...document.querySelectorAll('[role=menuitem], [role=menu], [role=listbox], [role=option]')].map(el => ({
+			tag: el.tagName.toLowerCase(),
+			role: el.getAttribute('role'),
+			text: norm(el.innerText).slice(0, 60),
+		})).slice(0, 30);
+		const btn = document.querySelector('bard-mode-switcher button');
+		return {
+			label: btn ? btn.getAttribute('aria-label') : '',
+			items: items,
+			roles: roles,
+			popovers: [...document.querySelectorAll('[popover], .cdk-overlay-container, [role=dialog]')].map(el => ({
+				tag: el.tagName.toLowerCase(),
+				cls: norm(el.className.toString()).slice(0, 80),
+				open: el.hasAttribute('open'),
+			})).slice(0, 10),
+		};
+	})())`
+	var raw string
+	if err := chromedp.Run(browser.BootCtx, chromedp.Evaluate(dumpJS, &raw)); err != nil {
+		return fmt.Errorf("despejar menu: %w", err)
+	}
+	var buf bytes.Buffer
+	if err := json.Indent(&buf, []byte(raw), "", "  "); err != nil {
+		fmt.Println(raw)
+	} else {
+		fmt.Println(buf.String())
+	}
+
+	// tenta selecionar "3.1 Pro" com sequência completa de eventos de
+	// ponteiro (algumas UIs ignoram click() sintético sem pointerdown/up)
+	fmt.Println("--- tentativa de clique em '3.1 Pro' ---")
+	var clickResult string
+	if err := chromedp.Run(browser.BootCtx,
+		chromedp.Evaluate(`(() => {
+			const items = [...document.querySelectorAll('gem-menu-item')];
+			const el = items.find(el => el.textContent.includes('3.1 Pro'));
+			if (!el) return 'item não encontrado';
+			const target = el.querySelector('button, [role=menuitem]') || el;
+			const r = target.getBoundingClientRect();
+			const opts = {bubbles: true, cancelable: true, clientX: r.x + r.width/2, clientY: r.y + r.height/2};
+			target.dispatchEvent(new PointerEvent('pointerdown', opts));
+			target.dispatchEvent(new MouseEvent('mousedown', opts));
+			target.dispatchEvent(new PointerEvent('pointerup', opts));
+			target.dispatchEvent(new MouseEvent('mouseup', opts));
+			target.click();
+			return 'clique em ' + target.tagName.toLowerCase();
+		})()`, &clickResult),
+		chromedp.Sleep(3000*time.Millisecond),
+		chromedp.Evaluate(`(() => {
+			const btn = document.querySelector('bard-mode-switcher button');
+			return (btn ? btn.getAttribute('aria-label') : '') + ' | itens: ' + document.querySelectorAll('gem-menu-item').length;
+		})()`, &clickResult),
+	); err != nil {
+		return fmt.Errorf("clique de teste: %w", err)
+	}
+	fmt.Println("clique:", clickResult)
+	return nil
+}
+
 // runModes abre o menu de modos do Gemini e, item por item, troca e lê o
 // rótulo ativo do botão — a tabela item ↔ rótulo que alimenta o registro
 // de modelos. Rodar com sessão logada e sem o serve no ar.
@@ -419,15 +536,18 @@ func runModes(ctx context.Context, cfg Config) error {
 		var post string
 		err := chromedp.Run(browser.BootCtx,
 			chromedp.Evaluate(openMenu, &dummy),
-			chromedp.Sleep(400*time.Millisecond),
+			chromedp.Sleep(600*time.Millisecond),
 			chromedp.Evaluate(fmt.Sprintf(`(() => {
 				const items = [...document.querySelectorAll('gem-menu-item')];
 				if (!items[%d]) return 'item não existe';
 				items[%d].click();
 				return '';
 			})()`, i, i), &dummy),
-			chromedp.Sleep(900*time.Millisecond),
+			// 2.5s: o rótulo ativo demora a atualizar (e submenus a
+			// renderizar) — 900ms dava leitura falsa do modo anterior
+			chromedp.Sleep(2500*time.Millisecond),
 			chromedp.Evaluate(postClick, &post),
+			chromedp.Evaluate(openMenu, &dummy), // fecha o menu de novo
 		)
 		if err != nil {
 			fmt.Printf("  %-24s ERRO: %v\n", item, err)

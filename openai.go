@@ -357,8 +357,12 @@ func handleChat(gw *Gateway) http.HandlerFunc {
 		text, err := g.Complete(ctx, msgs, req.Model)
 		if err != nil {
 			slog.Error("completion falhou", "err", err)
-			_, _, code, _ := completionErrorInfo(err)
-			thePanel.mutate(rec, func(r *reqRecord) { r.Status = code })
+			_, _, code, msg := completionErrorInfo(err)
+			thePanel.mutate(rec, func(r *reqRecord) {
+				r.Status = code
+				r.Err = msg
+				r.FullPrompt = promptText
+			})
 			writeCompletionError(w, err)
 			return
 		}
@@ -626,11 +630,18 @@ func streamChatCompletion(w http.ResponseWriter, ctx context.Context, g LLMWorke
 	}
 	if err != nil {
 		slog.Error("completion falhou (stream)", "err", err)
+		_, errType, code, msg := completionErrorInfo(err)
+		// rastro completo do erro no painel: código, mensagem e o prompt
+		// que foi enviado — sem isso o histórico só mostra "erro" seco
+		thePanel.mutate(rec, func(r *reqRecord) {
+			r.Status = code
+			r.Err = msg
+			r.FullPrompt = promptText
+		})
 		if !started {
 			writeCompletionError(w, err)
 			return
 		}
-		_, errType, code, msg := completionErrorInfo(err)
 		s.event(apiError{Error: apiErrorBody{Message: msg, Type: errType, Code: code}})
 		s.raw("data: [DONE]\n\n")
 		return
