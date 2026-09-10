@@ -13,7 +13,8 @@ services:
       DISPLAY: "${DISPLAY:-:0}"         # herda o display do host para o login
       # multi-profile: um browser por conta em round-robin (limite de uso é
       # por conta). Login de cada profile pelo painel (botão por profile).
-      BIFROST_PROFILES: "${BIFROST_PROFILES:-}"
+      # Sem login no 2º profile, ele só fica fora da rotação — inofensivo.
+      BIFROST_PROFILES: "${BIFROST_PROFILES:-/data/chrome-profile,/data/chrome-profile-2}"
       BIFROST_NO_SANDBOX: "true"        # obrigatório em container Docker
       BIFROST_PASSWORD_STORE: "basic"   # cookie encryption sem gnome-keyring
       # BIFROST_API_KEY: "troque-por-uma-chave-bem-longa"
