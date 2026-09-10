@@ -100,7 +100,8 @@ All settings are environment variables:
 |---|---|---|
 | `BIFROST_ADDR` | `:8080` | HTTP listen address |
 | `BIFROST_PROVIDER` | `gemini` | LLM provider: `gemini` or `chatgpt` (experimental) |
-| `BIFROST_POOL_SIZE` | `1` | Browser tabs in the pool (parallel conversations) |
+| `BIFROST_PROFILES` | *(none)* | Multi-profile: comma-separated Chrome profiles — one browser per account, round-robin (see below) |
+| `BIFROST_POOL_SIZE` | `1` | Tabs per profile (with sticky conversations, 1 is recommended — affinity is per profile) |
 | `BIFROST_PROFILE` | `./data/chrome-profile` | Chromium user data dir (persists login) |
 | `BIFROST_HEADLESS` | `false` | Run Chrome headless (set to `true` after login) |
 | `BIFROST_CHROME` | *(auto)* | Path to Chromium binary |
@@ -238,7 +239,32 @@ Benefits:
 
 Guard rails: a conversation reopens (fresh, full history) after 30 responses, on model change, when someone typed in the UI meanwhile, or when the last turn failed with uncertain state.
 
-> Note: with `BIFROST_POOL_SIZE > 1`, consecutive turns may land on different tabs and fall back to a fresh conversation (graceful degradation). Affinity routing is on the roadmap.
+> Note: with `BIFROST_POOL_SIZE > 1`, consecutive turns may land on different tabs **within the same profile** and fall back to a fresh conversation (graceful degradation). Cross-profile, the conversation key routes turns to the profile that owns the conversation — sticky survives multi-profile.
+
+---
+
+## Multi-Profile (Multiple Accounts)
+
+Gemini Web usage limits are **per account**. `BIFROST_PROFILES` runs one browser per Google account and rotates requests across them — N accounts ≈ N× the capacity (and N× the Pro quota):
+
+```yaml
+# docker-compose.yml
+volumes:
+  - ./data/chrome-profile:/data/chrome-profile
+  - ./data/chrome-profile-2:/data/chrome-profile-2
+environment:
+  BIFROST_PROFILES: "/data/chrome-profile,/data/chrome-profile-2"
+```
+
+How it behaves:
+
+- **Round-robin with conversation affinity** — consecutive turns of the same agent conversation return to the profile that owns it (sticky conversations survive multi-profile)
+- **Dead profiles self-heal out of the rotation** — a profile without a session (or with a dead browser) is skipped; requests never queue behind it
+- **Per-profile login from the panel** — each profile gets its own "conectar" button; the login of one profile doesn't interrupt the others
+- **Warm-up pre-marks empty profiles** — the first request never hits a cold 503; `/health` reports `{"profiles":"1/2","status":"ok"}`
+- **Disabled modes degrade per request** — when one account hits its Pro/Flash limit, its menu items go disabled; Bifrost logs the reason and serves from the current mode instead of failing
+
+> Keep one profile per Google account; duplicate paths collapse into one shard.
 
 ---
 
@@ -372,8 +398,8 @@ Ordered by impact for the main use case (agentic coding with a Gemini Pro subscr
 1. **Image input** — translate OpenAI `image_url` content parts into composer file uploads via CDP. Unlocks *screenshot → landing page* and mockup-driven generation.
 2. **Automatic model routing** — flash-lite/flash for trivial steps (file reads, summaries), pro for code-heavy turns; either per-request heuristics or a tiny classifier.
 3. **Per-client API keys** — multiple keys with per-key usage in the panel; share the gateway with a small team without exposing your account.
-4. **Cross-tab sticky affinity** — route consecutive turns of the same conversation to the tab that owns it (conversation URL as the routing key), making the pool fully sticky.
-5. **Multi-profile pool** — several Google accounts round-robin across tabs for more parallelism and separate rate limits.
+4. **Cross-tab sticky affinity** — route consecutive turns to the *tab* that owns the conversation (today affinity is per profile; `POOL_SIZE > 1` within a profile degrades to fresh conversations).
+5. ~~**Multi-profile pool**~~ — **done**: `BIFROST_PROFILES` runs one browser per account in round-robin with conversation affinity (see [Multi-Profile](#multi-profile-multiple-accounts)).
 6. **Sticky state persistence** — store conversation URLs + history hashes on disk so agent sessions survive gateway restarts.
 7. **Observer-only completion detection** — silence-based generation-end detection to retire most of the 300ms polling.
 

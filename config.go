@@ -3,25 +3,27 @@ package main
 import (
 	"os"
 	"strconv"
+	"strings"
 )
 
 // Config agrupa as poucas configurações do Bifrost, lidas direto do ambiente.
 type Config struct {
-	Addr          string // ex: ":8080"
-	Profile       string // ex: "./data/chrome-profile"
-	Headless      bool   // se true, oculta a janela do Chromium
-	ChromePath    string // path do binário (vazio = default do chromedp)
-	APIKey        string // se preenchido, exige Authorization: Bearer
-	LogLevel      string // debug, info, warn, error
-	Provider      string // provedor LLM default ("gemini" ou "chatgpt")
-	Model         string // modelo default quando o request omite "model"
-	PasswordStore string // keystore do Chrome: gnome-libsecret (desktop) ou basic (container)
-	NoSandbox     bool   // container Docker: seccomp default bloqueia o sandbox do Chrome
-	PoolSize      int    // número de abas simultâneas (concorrência)
+	Addr          string   // ex: ":8080"
+	Profile       string   // user-data-dir do Chromium (modo single-profile)
+	Profiles      []string // multi-profile: BIFROST_PROFILES, vírgula-separados (round-robin)
+	Headless      bool     // se true, oculta a janela do Chromium
+	ChromePath    string   // path do binário (vazio = default do chromedp)
+	APIKey        string   // se preenchido, exige Authorization: Bearer
+	LogLevel      string   // debug, info, warn, error
+	Provider      string   // provedor LLM default ("gemini" ou "chatgpt")
+	Model         string   // modelo default quando o request omite "model"
+	PasswordStore string   // keystore do Chrome: gnome-libsecret (desktop) ou basic (container)
+	NoSandbox     bool     // container Docker: seccomp default bloqueia o sandbox do Chrome
+	PoolSize      int      // abas por profile (concorrência)
 }
 
 func LoadConfig() Config {
-	return Config{
+	cfg := Config{
 		Addr:          envOr("BIFROST_ADDR", ":8080"),
 		Profile:       envOr("BIFROST_PROFILE", "./data/chrome-profile"),
 		Headless:      envBool("BIFROST_HEADLESS", false),
@@ -34,6 +36,20 @@ func LoadConfig() Config {
 		NoSandbox:     envBool("BIFROST_NO_SANDBOX", false),
 		PoolSize:      envInt("BIFROST_POOL_SIZE", 1),
 	}
+	// multi-profile: N contas em round-robin (o limite de uso é por conta).
+	// Profile vira o primeiro da lista — os comandos de diagnóstico (login,
+	// inspect, test) operam nele; o painel cuida do login dos demais.
+	if v := os.Getenv("BIFROST_PROFILES"); v != "" {
+		for _, p := range strings.Split(v, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				cfg.Profiles = append(cfg.Profiles, p)
+			}
+		}
+		if len(cfg.Profiles) > 0 {
+			cfg.Profile = cfg.Profiles[0]
+		}
+	}
+	return cfg
 }
 
 func envOr(key, def string) string {

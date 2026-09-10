@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log/slog"
 	"net/http"
@@ -220,6 +221,26 @@ func handleModel(gw *Gateway) http.HandlerFunc {
 	}
 }
 
+// conversationKey identifica a conversa entre turnos do mesmo agente: hash
+// do início do histórico (primeiras 2 mensagens com conteúdo) — estável
+// enquanto o cliente reenvia o histórico crescendo. No multi-profile, a
+// chave guia a AFINIDADE: turnos consecutivos caem no shard onde a conversa
+// aderente já vive.
+func conversationKey(msgs []Message) string {
+	h := fnv.New64a()
+	n := 0
+	for _, m := range msgs {
+		if m.Control || m.Nudge || m.Content == "" {
+			continue
+		}
+		fmt.Fprintf(h, "%s\x00%s\x00", m.Role, m.Content)
+		if n++; n == 2 {
+			break
+		}
+	}
+	return strconv.FormatUint(h.Sum64(), 16)
+}
+
 // contextLengthFor retorna a janela de contexto estimada para cada modelo.
 // O Gemini 2.5 Pro e Flash têm 1M tokens; Flash Lite tem 1M também.
 // Valores conservadores — a UI web pode ter limites menores em prática.
@@ -308,7 +329,7 @@ func handleChat(gw *Gateway) http.HandlerFunc {
 		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Minute)
 		defer cancel()
 
-		g, release, err := gw.acquire(ctx)
+		shardIdx, g, release, err := gw.acquire(ctx, conversationKey(req.Messages))
 		if err != nil {
 			thePanel.reject()
 			if errors.Is(err, context.DeadlineExceeded) {
@@ -350,13 +371,16 @@ func handleChat(gw *Gateway) http.HandlerFunc {
 		defer thePanel.end(rec)
 
 		if req.Stream {
-			streamChatCompletion(w, ctx, g, req, msgs, promptText, rec)
+			streamChatCompletion(w, ctx, gw, shardIdx, g, req, msgs, promptText, rec)
 			return
 		}
 
 		text, err := g.Complete(ctx, msgs, req.Model)
 		if err != nil {
 			slog.Error("completion falhou", "err", err)
+			if errors.Is(err, ErrGeminiNotLoggedIn) {
+				gw.markNoSession(shardIdx) // fora da rotação até login
+			}
 			_, _, code, msg := completionErrorInfo(err)
 			thePanel.mutate(rec, func(r *reqRecord) {
 				r.Status = code
@@ -505,7 +529,7 @@ func (s *sseWriter) raw(msg string) {
 // conteúdo — o loop de streaming os retém). Erros ANTES do primeiro byte
 // saem como status HTTP normais; depois dele, como evento de erro + [DONE]
 // — o protocolo não permite trocar o status no meio do stream.
-func streamChatCompletion(w http.ResponseWriter, ctx context.Context, g LLMWorker, req ChatCompletionRequest, msgs []Message, promptText string, rec *reqRecord) {
+func streamChatCompletion(w http.ResponseWriter, ctx context.Context, gw *Gateway, shardIdx int, g LLMWorker, req ChatCompletionRequest, msgs []Message, promptText string, rec *reqRecord) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeAPIError(w, http.StatusInternalServerError, errAPIError, "stream_unavailable",
@@ -630,6 +654,9 @@ func streamChatCompletion(w http.ResponseWriter, ctx context.Context, g LLMWorke
 	}
 	if err != nil {
 		slog.Error("completion falhou (stream)", "err", err)
+		if errors.Is(err, ErrGeminiNotLoggedIn) {
+			gw.markNoSession(shardIdx) // fora da rotação até login
+		}
 		_, errType, code, msg := completionErrorInfo(err)
 		// rastro completo do erro no painel: código, mensagem e o prompt
 		// que foi enviado — sem isso o histórico só mostra "erro" seco

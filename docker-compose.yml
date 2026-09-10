@@ -7,14 +7,18 @@ services:
       - "8081:8080"
     volumes:
       - ./data/chrome-profile:/data/chrome-profile
+      - ./data/chrome-profile-2:/data/chrome-profile-2  # segunda conta (multi-profile)
       - /tmp/.X11-unix:/tmp/.X11-unix  # login headed via painel
     environment:
       DISPLAY: "${DISPLAY:-:0}"         # herda o display do host para o login
+      # multi-profile: um browser por conta em round-robin (limite de uso é
+      # por conta). Login de cada profile pelo painel (botão por profile).
+      BIFROST_PROFILES: "${BIFROST_PROFILES:-}"
       BIFROST_NO_SANDBOX: "true"        # obrigatório em container Docker
       BIFROST_PASSWORD_STORE: "basic"   # cookie encryption sem gnome-keyring
       # BIFROST_API_KEY: "troque-por-uma-chave-bem-longa"
       # BIFROST_LOG: "info"
       # BIFROST_MODEL: "gemini-web-flash"
-      # BIFROST_POOL_SIZE: "3"          # Permite N requisições paralelas
+      # BIFROST_POOL_SIZE: "1"          # com conversa aderente, 1 aba/profile é o recomendado
     shm_size: "1gb"   # Chrome precisa de mais que os 64MB default de container
     restart: unless-stopped

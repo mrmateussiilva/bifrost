@@ -39,11 +39,16 @@ Uso:
 Env:
   BIFROST_ADDR      endereço HTTP (default ":8080")
   BIFROST_PROFILE   diretório do profile do Chromium (default "./data/chrome-profile")
+  BIFROST_PROFILES  multi-profile: diretórios vírgula-separados, um browser por
+                    conta em round-robin (o limite de uso do Gemini é por conta);
+                    sobrepõe BIFROST_PROFILE. Login de cada um pelo painel
   BIFROST_HEADLESS  rodar Chromium sem janela (default "false")
   BIFROST_CHROME    caminho do binário do Chromium, se não estiver no PATH
   BIFROST_API_KEY   se definida, exige Authorization: Bearer (default: sem auth)
   BIFROST_LOG       nível de log: debug|info|warn|error (default "info")
   BIFROST_MODEL     modelo default quando o request omite "model" (default "gemini-web")
+  BIFROST_POOL_SIZE abas por profile (default 1; com conversa aderente, 1 é o
+                    recomendado — afinidade é por profile)
   BIFROST_PASSWORD_STORE  keystore do Chrome: "gnome-libsecret" (default, desktop)
                     ou "basic" (container, sem gnome-keyring) — tem de ser o
                     mesmo em todo acesso ao profile
@@ -277,11 +282,10 @@ func runServe(ctx context.Context, cfg Config) error {
 	gw := NewGateway(ctx, cfg, GetProvider(cfg.Provider))
 	defer gw.close()
 
-	// warm-up: browser de pé antes de abrir a porta
-	if _, release, err := gw.acquire(ctx); err != nil {
+	// warm-up: browsers de TODOS os profiles de pé (e shards sem sessão
+	// pré-marcados) antes de abrir a porta
+	if err := gw.warmup(ctx); err != nil {
 		return err
-	} else {
-		release()
 	}
 
 	router := chi.NewRouter()

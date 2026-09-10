@@ -3,8 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -195,16 +197,40 @@ func handlePanelData(gw *Gateway) http.HandlerFunc {
 }
 
 // handlePanelLogin inicia o fluxo de login interativo (POST /panel/login).
+// Sem ?profile=N, escolhe o primeiro shard sem sessão.
 func handlePanelLogin(gw *Gateway) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !gw.TriggerLogin() {
+		idx := -1
+		if v := r.URL.Query().Get("profile"); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 0 {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "profile inválido"})
+				return
+			}
+			idx = n
+		} else {
+			var body struct {
+				Profile *int `json:"profile"`
+			}
+			if r.Body != nil {
+				_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<10)).Decode(&body)
+				if body.Profile != nil && *body.Profile >= 0 {
+					idx = *body.Profile
+				}
+			}
+		}
+		if idx < 0 {
+			idx = gw.firstShardNeedingLogin()
+		}
+		if !gw.TriggerLogin(idx) {
 			writeJSON(w, http.StatusConflict, map[string]string{
 				"error": "login já em andamento",
 			})
 			return
 		}
 		writeJSON(w, http.StatusAccepted, map[string]string{
-			"status": "iniciado",
+			"status":  "iniciado",
+			"profile": gw.shards[idx].name,
 		})
 	}
 }
@@ -241,6 +267,7 @@ func (p *panelData) snapshot(gw *Gateway) map[string]any {
 		"browser":  browser,
 		"session":  session,
 		"login":    login,
+		"shards":   gw.shardsStatus(),
 		"queue":    map[string]int{"depth": gw.queueDepth(), "cap": queueCap},
 		"uptime_s": int(time.Since(p.started).Seconds()),
 		"counters": p.counters,
@@ -459,6 +486,7 @@ td{padding:10px 16px;vertical-align:middle}
     </button>
   </div>
   <div id="loginStatus" style="display:none;margin-top:10px;font-size:12.5px;color:var(--tx)"></div>
+  <div id="loginShards"></div>
 </div>
 
 <section>
@@ -579,30 +607,51 @@ async function tick(){
     const qDepth = (d.queue&&d.queue.depth)||0;
     const qCap   = (d.queue&&d.queue.cap)||5;
     const lg     = d.login||{};
+    const shards = d.shards||[];
+    const profilesOk = shards.filter(function(s){return s.session==='ok'||s.session==='busy';}).length;
 
     // banner de sessão: visível quando falta sessão ou quando há login em
-    // andamento (mesmo disparado por outra aba/usuário do painel)
+    // andamento (mesmo disparado por outra aba/usuário do painel). Com
+    // vários profiles, cada um ganha seu botão de login.
     const banner = $('loginBanner');
     const lbtn = $('loginBtn');
+    const shardRow = shards.length>1
+      ? '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">'+shards.map(function(s,i){
+          const cls = s.session==='ok'?'b-ok':(s.session==='busy'?'b-acc':'b-err');
+          const badge = '<span class="badge '+cls+'" style="margin-right:6px">'+esc(s.profile)+'</span>';
+          const need = s.session!=='ok'&&s.session!=='busy';
+          const btn = need
+            ? '<span style="font-size:11.5px;color:var(--mut);cursor:pointer" onclick="startLogin('+i+')">conectar →</span>'
+            : '<span style="font-size:11.5px;color:var(--mut)">'+(s.session==='busy'?'gerando':'ok')+'</span>';
+          return '<div style="display:flex;align-items:center;gap:6px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:6px 12px">'+badge+btn+'</div>';
+        }).join('')+'</div>'
+      : '';
     if(lg.active){
       banner.style.display='';
-      $('loginTitle').textContent='Login em andamento';
+      $('loginTitle').textContent='Login em andamento'+(lg.profile?' — '+lg.profile:'');
       $('loginStatus').style.display='';
       $('loginStatus').innerHTML='⏳ '+esc(lg.message||'…');
+      $('loginShards').innerHTML=shardRow;
       if(lbtn) lbtn.disabled=true;
     } else if(!sessOk && !loginPolling){
       banner.style.display='';
       $('loginTitle').textContent='Sessão não encontrada';
+      $('loginShards').innerHTML=shardRow;
       if(lbtn) lbtn.disabled=false;
     } else if(sessOk){
       banner.style.display='none';
       if(loginPolling){ stopLoginPoll(true); }
+    } else {
+      $('loginShards').innerHTML=shardRow;
     }
     $('cards').innerHTML = [
       card('session', lg.active?'var(--warn)':(sessOk?'var(--ok)':'var(--err)'), 'Sessão',
-        lg.active
-          ? '<span class="badge b-warn pulse">em login…</span>'
-          : '<span class="badge '+(sessOk?'b-ok':'b-err')+'">'+(sessOk?'logada':'faltando')+'</span>'),
+        shards.length>1
+          ? '<span class="badge '+(profilesOk===shards.length?'b-ok':'b-warn')+'">'+profilesOk+'/'+shards.length+' profiles</span>'
+          : lg.active
+            ? '<span class="badge b-warn pulse">em login…</span>'
+            : '<span class="badge '+(sessOk?'b-ok':'b-err')+'">'+(sessOk?'logada':'faltando')+'</span>',
+        shards.length>1 ? 'round-robin por conta' : ''),
       card('browser', brwOk?'var(--ok)':'var(--err)', 'Browser',
         '<span class="badge '+(brwOk?'b-ok':'b-err')+'">'+(brwOk?'de pé':'caído')+'</span>'),
       card('queue', 'var(--acc)', 'Fila',
@@ -699,7 +748,7 @@ function stopLoginPoll(success){
   }
 }
 
-async function startLogin(){
+async function startLogin(profile){
   const btn = $('loginBtn');
   const st  = $('loginStatus');
   // visível mesmo com sessão ok: login proativo pelo botão do header
@@ -710,7 +759,8 @@ async function startLogin(){
   st.innerHTML='<span style="color:var(--acc)">⏳ Iniciando…</span>';
 
   try{
-    const r = await fetch('/panel/login', {method:'POST'});
+    const url = '/panel/login'+(profile!=null?'?profile='+profile:'');
+    const r = await fetch(url, {method:'POST'});
     if(r.status===409){
       st.innerHTML='<span style="color:var(--warn)">Login já em andamento</span>';
       if(btn) btn.disabled=false;

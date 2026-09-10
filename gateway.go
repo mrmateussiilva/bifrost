@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -12,7 +13,7 @@ import (
 	"github.com/chromedp/chromedp"
 )
 
-// queuedRequests: quantas requisições podem esperar além da que executa.
+// queuedRequests: quantas requisições podem esperar além das que executam.
 // Acima disso, 429 em vez de cliente preso por minutos.
 const queuedRequests = 4
 
@@ -21,43 +22,87 @@ type LoginStatus struct {
 	Active  bool   `json:"active"`
 	Done    bool   `json:"done"`
 	Ok      bool   `json:"ok"`
+	Profile string `json:"profile,omitempty"`
 	Message string `json:"message"`
 }
 
-// Gateway supervisiona o Chromium: relança se morrer (auto-recuperação),
-// gerencia um pool de abas para concorrência e limita a fila de espera.
+// errLoginInProgress: login de painel em andamento neste profile — o browser
+// de login detém o user-data-dir; relançar aqui falharia com singleton.
+var errLoginInProgress = errors.New("login em andamento pelo painel; aguarde a conclusão e tente de novo")
+
+// shard: um browser amarrado a um profile (conta), com seu pool de abas.
+// Multi-profile = N shards em round-robin — o limite de uso do Gemini web
+// é por CONTA, então N contas multiplicam a capacidade.
+type shard struct {
+	name      string     // base do diretório do profile (exibição)
+	cfg       Config     // config com Profile deste shard
+	mu        sync.Mutex // browser/workers em seções críticas curtas
+	browser   *Browser
+	workers   []LLMWorker
+	sem       chan int    // tokens de aba (0..poolSize-1)
+	noSession atomic.Bool // sessão ausente: fora da rotação até login
+}
+
+// Gateway supervisiona os shards: round-robin com AFINIDADE de conversa
+// (turnos consecutivos do mesmo agente caem no shard onde a conversa
+// aderente já vive), relança browsers mortos e limita a fila de espera.
 type Gateway struct {
-	cfg     Config
+	cfg     Config          // config global (model default etc.); por-shard: shard.cfg
 	ctx     context.Context // ciclo de vida do servidor (browser não morre com um request)
-	sem     chan int        // tokens de índice (0 a PoolSize-1) para as abas
-	swapMu  sync.Mutex      // protege browser/workers em seções críticas curtas
-	browser *Browser
 	factory ProviderFactory
-	workers []LLMWorker
-	queue   chan struct{} // cap PoolSize+queuedRequests: admissão total
+	shards  []*shard
+	rr      atomic.Int64  // ponteiro de round-robin
+	queue   chan struct{} // admissão total (todas as abas + espera)
+	free    chan struct{} // sinal de aba liberada (acordar waiters)
+	convMu  sync.Mutex
+	conv    map[string]int // chave de conversa → shard (afinidade)
 
 	loginActive atomic.Bool
+	loginShard  int
 	loginMu     sync.RWMutex
 	loginStatus LoginStatus
 }
 
 func NewGateway(ctx context.Context, cfg Config, factory ProviderFactory) *Gateway {
+	profiles := cfg.Profiles
+	if len(profiles) == 0 {
+		profiles = []string{cfg.Profile}
+	}
 	poolSize := cfg.PoolSize
 	if poolSize < 1 {
 		poolSize = 1
 	}
-	gw := &Gateway{
+	totalTabs := 0
+	shards := make([]*shard, 0, len(profiles))
+	seen := map[string]bool{}
+	for _, p := range profiles {
+		if seen[p] {
+			continue // profile duplicado: um browser por user-data-dir
+		}
+		seen[p] = true
+		sc := cfg
+		sc.Profile = p
+		s := &shard{
+			name:    filepath.Base(p),
+			cfg:     sc,
+			workers: make([]LLMWorker, poolSize),
+			sem:     make(chan int, poolSize),
+		}
+		for i := 0; i < poolSize; i++ {
+			s.sem <- i
+		}
+		shards = append(shards, s)
+		totalTabs += poolSize
+	}
+	return &Gateway{
 		cfg:     cfg,
 		ctx:     ctx,
-		sem:     make(chan int, poolSize),
 		factory: factory,
-		workers: make([]LLMWorker, poolSize),
-		queue:   make(chan struct{}, poolSize+queuedRequests),
+		shards:  shards,
+		queue:   make(chan struct{}, totalTabs+queuedRequests),
+		free:    make(chan struct{}, totalTabs),
+		conv:    map[string]int{},
 	}
-	for i := 0; i < poolSize; i++ {
-		gw.sem <- i
-	}
-	return gw
 }
 
 // tryAdmit devolve false (429) quando a fila está cheia.
@@ -70,76 +115,218 @@ func (gw *Gateway) tryAdmit() (leave func(), ok bool) {
 	}
 }
 
-// acquire devolve um worker do pool vivo, relançando o Chromium se tiver morrido.
-func (gw *Gateway) acquire(ctx context.Context) (LLMWorker, func(), error) {
-	var idx int
+// poke acorda waiters do acquire (sinal de aba liberada).
+func (gw *Gateway) poke() {
 	select {
-	case idx = <-gw.sem:
-	case <-ctx.Done():
-		return nil, nil, ctx.Err()
+	case gw.free <- struct{}{}:
+	default:
 	}
-	release := func() { gw.sem <- idx }
-
-	gw.swapMu.Lock()
-	browser, worker := gw.browser, gw.workers[idx]
-	dead := browser == nil || !browser.Alive()
-
-	if dead {
-		if gw.loginActive.Load() {
-			// login pelo painel em andamento: o browser de login detém o
-			// profile — relançar aqui falharia com erro de singleton
-			// confuso. Erro claro em vez disso.
-			gw.swapMu.Unlock()
-			release()
-			return nil, nil, errors.New("login em andamento pelo painel; aguarde a conclusão e tente de novo")
-		}
-		if err := gw.recoverLocked(); err != nil {
-			gw.swapMu.Unlock()
-			release()
-			return nil, nil, err
-		}
-		worker = gw.workers[idx]
-	}
-	gw.swapMu.Unlock()
-
-	return worker, release, nil
 }
 
-// recoverLocked relança o browser e recria todas as abas. Deve ser chamado com swapMu bloqueado.
-func (gw *Gateway) recoverLocked() error {
-	if gw.browser != nil {
-		slog.Warn("browser morto; relançando")
-		gw.browser.Close()
+// convLookup devolve o shard dono da conversa (afinidade).
+func (gw *Gateway) convLookup(key string) (int, bool) {
+	if key == "" {
+		return 0, false
+	}
+	gw.convMu.Lock()
+	defer gw.convMu.Unlock()
+	idx, ok := gw.conv[key]
+	if ok && idx >= 0 && idx < len(gw.shards) {
+		return idx, true
+	}
+	return 0, false
+}
+
+// convBind registra a conversa no shard que a atendeu. Mapa com teto: ao
+// passar de 1024 chaves, zera — conversas mortas não acumulam para sempre;
+// uma conversa viva re-registra no próximo turno.
+func (gw *Gateway) convBind(key string, idx int) {
+	if key == "" {
+		return
+	}
+	gw.convMu.Lock()
+	if len(gw.conv) > 1024 {
+		gw.conv = map[string]int{}
+	}
+	gw.conv[key] = idx
+	gw.convMu.Unlock()
+}
+
+// Estados de tryShard.
+const (
+	shardGot  = iota // aba adquirida (worker válido)
+	shardBusy        // sem aba livre
+	shardSkip        // fora da rotação (sem sessão / login em andamento)
+)
+
+// tryShard tenta adquirir uma aba do shard de forma NÃO-bloqueante,
+// relançando o browser se morto. Estados: shardGot (worker pronto),
+// shardBusy (todas as abas ocupadas), shardSkip + err (falhou: recover
+// ou login em andamento neste profile), shardSkip sem err (fora da
+// rotação: sessão ausente).
+func (gw *Gateway) tryShard(idx int) (int, LLMWorker, func(), error) {
+	s := gw.shards[idx]
+	if s.noSession.Load() {
+		return shardSkip, nil, nil, nil
+	}
+	var i int
+	select {
+	case i = <-s.sem:
+	default:
+		return shardBusy, nil, nil, nil
+	}
+	release := func() { s.sem <- i; gw.poke() }
+	s.mu.Lock()
+	if s.browser == nil || !s.browser.Alive() {
+		if gw.loginActive.Load() && gw.loginShard == idx {
+			s.mu.Unlock()
+			release()
+			return shardSkip, nil, nil, errLoginInProgress
+		}
+		if err := gw.recoverShardLocked(s); err != nil {
+			s.mu.Unlock()
+			release()
+			return shardSkip, nil, nil, fmt.Errorf("relançar chromium (profile %s): %w", s.name, err)
+		}
+	}
+	w := s.workers[i]
+	s.mu.Unlock()
+	return shardGot, w, release, nil
+}
+
+// acquire devolve uma aba de um shard: AFINIDADE primeiro (o shard dono da
+// conversa mantém o estado da conversa aderente), round-robin depois. Sem
+// aba livre em shard algum, espera o sinal de liberação. Devolve o índice
+// do shard (para marcar sessão ausente quando o worker reclamar).
+func (gw *Gateway) acquire(ctx context.Context, convKey string) (int, LLMWorker, func(), error) {
+	// afinidade: turnos consecutivos voltam ao shard da conversa
+	if idx, ok := gw.convLookup(convKey); ok {
+		if st, w, rel, err := gw.tryShard(idx); st == shardGot {
+			return idx, w, rel, nil
+		} else if err != nil {
+			_ = err // o scan abaixo reflete melhor o estado do conjunto
+		}
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return -1, nil, nil, err
+		}
+		start := int(gw.rr.Add(1)) % len(gw.shards)
+		var lastErr error
+		anyBusy := false
+		for i := 0; i < len(gw.shards); i++ {
+			idx := (start + i) % len(gw.shards)
+			st, w, rel, err := gw.tryShard(idx)
+			if st == shardGot {
+				gw.convBind(convKey, idx)
+				return idx, w, rel, nil
+			}
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			if st == shardBusy {
+				anyBusy = true
+			}
+		}
+		// nada livre: se alguém está OCUPADO, esperar vale a pena (vai
+		// liberar); se todos estão fora da rotação, esperar é hang — erro.
+		if anyBusy {
+			select {
+			case <-ctx.Done():
+				return -1, nil, nil, ctx.Err()
+			case <-gw.free:
+			}
+			continue
+		}
+		if lastErr != nil {
+			return -1, nil, nil, lastErr
+		}
+		return -1, nil, nil, errors.New("nenhuma sessão disponível; abra o painel para conectar um profile")
+	}
+}
+
+// recoverShardLocked relança o browser do shard e recria suas abas. Deve
+// ser chamado com s.mu bloqueado.
+func (gw *Gateway) recoverShardLocked(s *shard) error {
+	if s.browser != nil {
+		slog.Warn("browser morto; relançando", "profile", s.name)
+		s.browser.Close()
 	} else {
-		slog.Info("browser starting")
+		slog.Info("browser starting", "profile", s.name)
 	}
 
-	b, err := StartBrowser(gw.ctx, gw.cfg)
+	b, err := StartBrowser(gw.ctx, s.cfg)
 	if err != nil {
-		return fmt.Errorf("relançar chromium: %w", err)
+		return err
 	}
-	gw.browser = b
+	s.browser = b
 
-	// Recria o pool de abas
-	for i := 0; i < gw.cfg.PoolSize; i++ {
+	for i := 0; i < len(s.workers); i++ {
 		var tabCtx context.Context
 		if i == 0 {
 			// Reaproveita a aba de boot (about:blank inicial)
 			tabCtx = b.BootCtx
 		} else {
-			var cancelTab context.CancelFunc
-			tabCtx, cancelTab = chromedp.NewContext(b.AllocCtx)
-			_ = cancelTab // o chromedp cancela as abas quando allocCtx morre
+			tabCtx, _ = chromedp.NewContext(b.AllocCtx)
+			// o chromedp cancela as abas quando o allocCtx morre
 		}
 		if err := gw.factory.Open(tabCtx); err != nil {
 			b.Close()
 			return fmt.Errorf("falha ao navegar aba %d: %w", i, err)
 		}
-		gw.workers[i] = gw.factory.NewWorker(tabCtx)
+		s.workers[i] = gw.factory.NewWorker(tabCtx)
 	}
-
-	slog.Info("browser recovered", "pool_size", gw.cfg.PoolSize)
+	slog.Info("browser up", "profile", s.name, "pool_size", len(s.workers))
 	return nil
+}
+
+// warmup sobe os browsers de TODOS os shards e pré-marca os que estão sem
+// sessão — sem isso, a primeira requisição de cada profile vazio esbarrava
+// num 503 de cold-start; com a marca, a rotação já começa certeira e o
+// painel mostra quais profiles precisam de login.
+func (gw *Gateway) warmup(ctx context.Context) error {
+	started := 0
+	var lastErr error
+	for _, s := range gw.shards {
+		s.mu.Lock()
+		if s.browser == nil || !s.browser.Alive() {
+			if err := gw.recoverShardLocked(s); err != nil {
+				lastErr = err
+				browser := s.browser
+				s.mu.Unlock()
+				if browser != nil {
+					browser.Close()
+				}
+				slog.Error("warmup: browser não subiu", "profile", s.name, "err", err)
+				continue
+			}
+		}
+		b := s.browser
+		s.mu.Unlock()
+		started++
+		state, _, err := gw.factory.State(b.BootCtx)
+		if err == nil && state != stateLoggedIn {
+			s.noSession.Store(true)
+			slog.Warn("warmup: sessão ausente — login pelo painel", "profile", s.name)
+		}
+	}
+	if started == 0 && lastErr != nil {
+		return fmt.Errorf("nenhum browser subiu: %w", lastErr)
+	}
+	return nil
+}
+
+// markNoSession tira o shard da rotação (a próxima requisição dele seria
+// 503 gemini_not_logged_in; sem a marca, cada turno esbarraria de novo).
+func (gw *Gateway) markNoSession(idx int) {
+	if idx < 0 || idx >= len(gw.shards) {
+		return
+	}
+	s := gw.shards[idx]
+	if !s.noSession.Swap(true) {
+		slog.Warn("sessão ausente; profile fora da rotação até login", "profile", s.name)
+	}
 }
 
 // queueDepth reporta quantos requests esperam (para o painel).
@@ -147,39 +334,107 @@ func (gw *Gateway) queueDepth() int {
 	return len(gw.queue)
 }
 
-// status reporta saúde sem bloquear atrás de uma geração em andamento.
+// status agrega a saúde dos shards sem bloquear atrás de geração em
+// andamento. Shards ocupados contam como ok (estão gerando = sessão
+// funciona). Shard sem sessão é marcado — a rotação se auto-cura.
 func (gw *Gateway) status() map[string]string {
 	if gw.loginActive.Load() {
-		// login pelo painel em andamento: o browser de login está de pé,
-		// mas o pool de produção só volta quando a sessão confirmar
 		return map[string]string{"status": "login", "browser": "up"}
 	}
-	select {
-	case idx := <-gw.sem:
-		gw.sem <- idx
-	default:
-		return map[string]string{"status": "ok", "busy": "true"}
+	nOK, nDown, nMissing := 0, 0, 0
+	for _, s := range gw.shards {
+		select {
+		case i := <-s.sem:
+			s.sem <- i
+		default:
+			nOK++ // ocupado gerando
+			continue
+		}
+		if s.noSession.Load() {
+			nMissing++
+			continue
+		}
+		s.mu.Lock()
+		alive := s.browser != nil && s.browser.Alive()
+		s.mu.Unlock()
+		if !alive {
+			nDown++
+			continue
+		}
+		state, _, err := gw.factory.State(s.browser.BootCtx)
+		if err != nil || state != stateLoggedIn {
+			s.noSession.Store(true)
+			nMissing++
+			continue
+		}
+		nOK++
 	}
-
-	gw.swapMu.Lock()
-	defer gw.swapMu.Unlock()
-	if gw.browser == nil || !gw.browser.Alive() {
+	switch {
+	case nOK > 0:
+		return map[string]string{"status": "ok", "profiles": fmt.Sprintf("%d/%d", nOK, len(gw.shards))}
+	case nDown > 0:
 		return map[string]string{"status": "degraded", "browser": "down"}
-	}
-	state, _, err := gw.factory.State(gw.browser.BootCtx)
-	if err != nil || state != stateLoggedIn {
+	default:
 		return map[string]string{"status": "degraded", "session": "missing"}
 	}
-	return map[string]string{"status": "ok"}
 }
 
-// close encerra o browser supervisionado.
+// shardStatus é o retrato de um shard para o painel.
+type shardStatus struct {
+	Profile string `json:"profile"`
+	Session string `json:"session"` // ok | busy | missing | down
+	Busy    bool   `json:"busy"`
+}
+
+// shardsStatus devolve o estado individual de cada profile (painel).
+func (gw *Gateway) shardsStatus() []shardStatus {
+	out := make([]shardStatus, 0, len(gw.shards))
+	for _, s := range gw.shards {
+		st := shardStatus{Profile: s.name, Session: "ok"}
+		select {
+		case i := <-s.sem:
+			s.sem <- i
+		default:
+			st.Busy = true
+			st.Session = "busy"
+			out = append(out, st)
+			continue
+		}
+		if s.noSession.Load() {
+			st.Session = "missing"
+			out = append(out, st)
+			continue
+		}
+		s.mu.Lock()
+		alive := s.browser != nil && s.browser.Alive()
+		s.mu.Unlock()
+		if !alive {
+			st.Session = "down"
+		}
+		out = append(out, st)
+	}
+	return out
+}
+
+// firstShardNeedingLogin: o profile default do botão de login do painel.
+func (gw *Gateway) firstShardNeedingLogin() int {
+	for i, s := range gw.shards {
+		if s.noSession.Load() {
+			return i
+		}
+	}
+	return 0
+}
+
+// close encerra os browsers supervisionados.
 func (gw *Gateway) close() {
-	gw.swapMu.Lock()
-	defer gw.swapMu.Unlock()
-	if gw.browser != nil {
-		gw.browser.Close()
-		gw.browser = nil
+	for _, s := range gw.shards {
+		s.mu.Lock()
+		if s.browser != nil {
+			s.browser.Close()
+			s.browser = nil
+		}
+		s.mu.Unlock()
 	}
 }
 
@@ -196,46 +451,53 @@ func (gw *Gateway) setLoginStatus(s LoginStatus) {
 	gw.loginMu.Unlock()
 }
 
-// TriggerLogin inicia o fluxo de login interativo a partir do painel.
-func (gw *Gateway) TriggerLogin() bool {
+// TriggerLogin inicia o fluxo de login interativo do shard idx a partir do
+// painel. Os DEMAIS shards seguem servindo — só o profile em login sai do
+// ar (o browser de login detém o user-data-dir dele).
+func (gw *Gateway) TriggerLogin(idx int) bool {
+	if idx < 0 || idx >= len(gw.shards) {
+		return false
+	}
 	if !gw.loginActive.CompareAndSwap(false, true) {
 		return false // já em andamento
 	}
+	gw.loginShard = idx
+	s := gw.shards[idx]
 	go func() {
 		defer gw.loginActive.Store(false)
 
-		gw.setLoginStatus(LoginStatus{Active: true, Message: "Fechando browser atual…"})
+		gw.setLoginStatus(LoginStatus{Active: true, Profile: s.name, Message: "Fechando browser atual (" + s.name + ")…"})
 
-		gw.swapMu.Lock()
-		if gw.browser != nil {
-			gw.browser.Close()
-			gw.browser = nil
-			for i := range gw.workers {
-				gw.workers[i] = nil
+		s.mu.Lock()
+		if s.browser != nil {
+			s.browser.Close()
+			s.browser = nil
+			for i := range s.workers {
+				s.workers[i] = nil
 			}
 		}
-		gw.swapMu.Unlock()
+		s.mu.Unlock()
 
-		gw.setLoginStatus(LoginStatus{Active: true, Message: "Abrindo Chrome para login…"})
+		gw.setLoginStatus(LoginStatus{Active: true, Profile: s.name, Message: "Abrindo Chrome para login (" + s.name + ")…"})
 
-		cfg := gw.cfg
+		cfg := s.cfg
 		cfg.Headless = false
 		b, err := StartBrowser(gw.ctx, cfg)
 		if err != nil {
-			slog.Error("login: falhou ao abrir browser", "err", err)
-			gw.setLoginStatus(LoginStatus{Done: true, Ok: false, Message: "Erro ao abrir o Chrome: " + err.Error()})
+			slog.Error("login: falhou ao abrir browser", "profile", s.name, "err", err)
+			gw.setLoginStatus(LoginStatus{Done: true, Ok: false, Profile: s.name, Message: "Erro ao abrir o Chrome: " + err.Error()})
 			return
 		}
 
 		if err := gw.factory.Open(b.BootCtx); err != nil {
 			b.Close()
-			slog.Error("login: falhou ao abrir provedor", "err", err)
-			gw.setLoginStatus(LoginStatus{Done: true, Ok: false, Message: "Erro ao navegar ao provedor: " + err.Error()})
+			slog.Error("login: falhou ao abrir provedor", "profile", s.name, "err", err)
+			gw.setLoginStatus(LoginStatus{Done: true, Ok: false, Profile: s.name, Message: "Erro ao navegar ao provedor: " + err.Error()})
 			return
 		}
 
-		gw.setLoginStatus(LoginStatus{Active: true, Message: "Aguardando login na janela do Chrome…"})
-		slog.Info("login: janela aberta, aguardando login do usuário")
+		gw.setLoginStatus(LoginStatus{Active: true, Profile: s.name, Message: "Aguardando login na janela do Chrome (" + s.name + ")…"})
+		slog.Info("login: janela aberta, aguardando login do usuário", "profile", s.name)
 
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
@@ -246,14 +508,14 @@ func (gw *Gateway) TriggerLogin() bool {
 			select {
 			case <-gw.ctx.Done():
 				b.Close()
-				gw.setLoginStatus(LoginStatus{Done: true, Ok: false, Message: "Servidor encerrado durante o login"})
+				gw.setLoginStatus(LoginStatus{Done: true, Ok: false, Profile: s.name, Message: "Servidor encerrado durante o login"})
 				return
 			case <-b.BootCtx.Done():
-				gw.setLoginStatus(LoginStatus{Done: true, Ok: false, Message: "Janela do Chrome fechada antes do login ser confirmado"})
+				gw.setLoginStatus(LoginStatus{Done: true, Ok: false, Profile: s.name, Message: "Janela do Chrome fechada antes do login ser confirmado"})
 				return
 			case <-timeout.C:
 				b.Close()
-				gw.setLoginStatus(LoginStatus{Done: true, Ok: false, Message: "Timeout: login não completado em 5 minutos"})
+				gw.setLoginStatus(LoginStatus{Done: true, Ok: false, Profile: s.name, Message: "Timeout: login não completado em 5 minutos"})
 				return
 			case <-ticker.C:
 				state, _, err := gw.factory.State(b.BootCtx)
@@ -261,8 +523,8 @@ func (gw *Gateway) TriggerLogin() bool {
 					continue
 				}
 				if state == stateLoggedIn {
-					slog.Info("login: sessão confirmada")
-					gw.setLoginStatus(LoginStatus{Active: true, Message: "Sessão confirmada! Gravando e restaurando o gateway…"})
+					slog.Info("login: sessão confirmada", "profile", s.name)
+					gw.setLoginStatus(LoginStatus{Active: true, Profile: s.name, Message: "Sessão confirmada! Gravando e restaurando o gateway…"})
 
 					// cortesia: deixa redirects e cookies assentarem antes do
 					// close gracioso (que grava o profile em disco)
@@ -275,23 +537,22 @@ func (gw *Gateway) TriggerLogin() bool {
 					}
 
 					// O browser de login NÃO vira o browser de produção: ele é
-					// headed por natureza e, se o usuário fechasse a janela (ou
-					// o timeout de 2min antigo disparasse), instalávamos um
-					// browser morto no gateway — "browser down" no painel até o
-					// próximo request se auto-curar. Close gracioso + relança
-					// com a config normal (respeita BIFROST_HEADLESS).
+					// headed por natureza e, se o usuário fechasse a janela,
+					// instalaríamos um browser morto no shard. Close gracioso +
+					// relança com a config normal (respeita BIFROST_HEADLESS).
 					b.Close()
 
-					gw.swapMu.Lock()
-					rerr := gw.recoverLocked()
-					gw.swapMu.Unlock()
+					s.mu.Lock()
+					rerr := gw.recoverShardLocked(s)
+					s.mu.Unlock()
 					if rerr != nil {
-						slog.Error("login: falhou ao restaurar gateway", "err", rerr)
-						gw.setLoginStatus(LoginStatus{Done: true, Ok: false, Message: "Sessão ok, mas falhou ao restaurar o browser: " + rerr.Error()})
+						slog.Error("login: falhou ao restaurar shard", "profile", s.name, "err", rerr)
+						gw.setLoginStatus(LoginStatus{Done: true, Ok: false, Profile: s.name, Message: "Sessão ok, mas falhou ao restaurar o browser: " + rerr.Error()})
 						return
 					}
-					gw.setLoginStatus(LoginStatus{Done: true, Ok: true, Message: "Login concluído com sucesso!"})
-					slog.Info("login: gateway restaurado com nova sessão", "pool_size", gw.cfg.PoolSize)
+					s.noSession.Store(false)
+					gw.setLoginStatus(LoginStatus{Done: true, Ok: true, Profile: s.name, Message: "Login concluído: " + s.name})
+					slog.Info("login: shard restaurado com nova sessão", "profile", s.name, "pool_size", len(s.workers))
 					return
 				}
 			}
