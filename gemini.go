@@ -201,7 +201,7 @@ func responseStructureJS() string {
 		return {
 			count: responses.length,
 			last: {tag: last.tagName.toLowerCase(), cls: (last.className || '').toString().slice(0, 70)},
-			children: [...last.children].slice(0, 20).map(c => kid(c, 6))
+			children: [...last.children].slice(0, 20).map(c => kid(c, 10))
 		};
 	})())`, geminiSelectors.Response)
 }
@@ -434,10 +434,18 @@ func SerializeMessages(messages []Message) string {
 // DOM, blocos de markdown como texto — nunca o innerText bruto do code
 // block, cujo header inclui o rótulo da linguagem). Compartilhada pelo
 // polling de estado (genStateJS) e pelo observer de streaming (observerJS).
+//
+// Fidelidade de escrita de código (bugs corrigidos contra o DOM real):
+//   - table-block (a UI renderiza tabelas assim) virava nada — agora vira
+//     tabela markdown com pipes, células escapadas
+//   - listas aninhadas achatavam num nível — agora indentam 2 espaços/nível
+//   - formatação inline sumia (code sem backticks, bold sem **): inlineMD
+//     converte numa cópia do nó, sem tocar no DOM real
 const jsPartsFn = `function(sel) {
 	const responses = document.querySelectorAll(sel);
 	const last = responses.length ? responses[responses.length - 1] : null;
 	const parts = [];
+	const BT = String.fromCharCode(96);
 	const isCodeHost = el => {
 		const tag = el.tagName.toLowerCase();
 		return tag === 'code-block' || tag === 'response-element';
@@ -450,37 +458,95 @@ const jsPartsFn = `function(sel) {
 		if (lang || code.trim()) parts.push({k: 'code', lang: lang, code: code});
 		return true;
 	};
-	const blockTags = new Set(['p','h1','h2','h3','h4','h5','h6','ul','ol','table','blockquote','pre']);
+	// inlineMD: formatação inline vira marcador markdown numa CLONE do nó
+	// (o DOM real não é tocado) — code → backticks, b/strong → **, em/i → *
+	const inlineMD = el => {
+		const clone = el.cloneNode(true);
+		clone.querySelectorAll('code').forEach(c => {
+			if (c.closest('code-block')) return;
+			c.replaceWith(BT + (c.innerText || '') + BT);
+		});
+		clone.querySelectorAll('b, strong').forEach(c => c.replaceWith('**' + (c.innerText || '') + '**'));
+		clone.querySelectorAll('em, i').forEach(c => c.replaceWith('*' + (c.innerText || '') + '*'));
+		return (clone.innerText || '').trim();
+	};
+	// pushTable: table-block (ou table crua) vira tabela markdown — células
+	// em linha única com pipes escapados, separador após o cabeçalho
+	const pushTable = el => {
+		const t = el.matches('table') ? el : el.querySelector('table');
+		if (!t) return false;
+		const cell = c => (c.innerText || '').replace(/\|/g, '\\|').replace(/\s+/g, ' ').trim();
+		const rows = [...t.querySelectorAll('tr')].map(tr => [...tr.children].map(cell)).filter(r => r.length);
+		if (!rows.length) return false;
+		const nCols = Math.max(...rows.map(r => r.length));
+		const norm = rows.map(r => { const out = r.slice(); while (out.length < nCols) out.push(''); return out; });
+		const md = ['| ' + norm[0].join(' | ') + ' |', '| ' + Array(nCols).fill('---').join(' | ') + ' |']
+			.concat(norm.slice(1).map(r => '| ' + r.join(' | ') + ' |')).join('\n');
+		parts.push({k: 'text', text: md});
+		return true;
+	};
+	// listMD: listas aninhadas com indentação de 2 espaços por nível
+	const listMD = (el, depth) => {
+		const lines = [];
+		const ordered = el.tagName.toLowerCase() === 'ol';
+		[...el.children].forEach((li, i) => {
+			if (li.tagName.toLowerCase() !== 'li') return;
+			const clone = li.cloneNode(true);
+			clone.querySelectorAll('ul, ol').forEach(sub => sub.remove());
+			const own = inlineMD(clone);
+			if (own) lines.push('  '.repeat(depth) + (ordered ? (i + 1) + '. ' : '- ') + own);
+			[...li.children].forEach(sub => {
+				const st = sub.tagName.toLowerCase();
+				if (st === 'ul' || st === 'ol') lines.push(...listMD(sub, depth + 1));
+			});
+		});
+		return lines;
+	};
+	const blockTags = new Set(['p','h1','h2','h3','h4','h5','h6','ul','ol','blockquote','pre','hr']);
 	const pushText = el => {
 		const tag = el.tagName.toLowerCase();
 		// só blocos de markdown contam como resposta; o resto (chips de
 		// follow-up, rodapés, containers) é enfeite da UI, não conteúdo
 		if (!blockTags.has(tag)) return;
 		let t = '';
-		if (/^h[1-6]$/.test(tag)) t = '#'.repeat(+tag[1]) + ' ' + el.innerText.trim();
-		else if (tag === 'ul' || tag === 'ol') {
-			t = [...el.children].map((li, i) =>
-				(tag === 'ol' ? (i + 1) + '. ' : '- ') + li.innerText.trim()).join('\n');
-		} else t = el.innerText.trim();
+		if (tag === 'hr') t = '---';
+		else if (/^h[1-6]$/.test(tag)) t = '#'.repeat(+tag[1]) + ' ' + inlineMD(el);
+		else if (tag === 'ul' || tag === 'ol') t = listMD(el, 0).join('\n');
+		else t = inlineMD(el);
 		if (t) parts.push({k: 'text', text: t});
 	};
-	if (last) for (const child of last.children) {
-		if (isCodeHost(child)) {
-			if (!pushCode(child)) pushText(child);
-			continue;
-		}
-		// o texto mora dentro dos contêineres .markdown; os demais
-		// filhos diretos (rodapés, botões) não fazem parte da resposta
-		if ((child.className || '').toString().includes('markdown')) {
-			for (const block of child.children) {
-				if (isCodeHost(block)) {
-					if (!pushCode(block)) pushText(block);
-				} else {
-					pushText(block);
-				}
+	const isTableBlock = el => {
+		const tag = el.tagName.toLowerCase();
+		return tag === 'table-block' || tag === 'table';
+	};
+	// SKIP: enfeites da UI — botões, rodapés de resposta/ações, chips de
+	// follow-up, barras de export. O texto deles não é conteúdo.
+	const SKIP = el => {
+		const tag = el.tagName.toLowerCase();
+		if (tag === 'button' || tag === 'svg' || tag === 'mat-icon') return true;
+		return /(footer|message-actions|feedback|follow-up|carousel|hide-on-print)/i
+			.test((el.className || '').toString());
+	};
+	// walk: desce RECURSIVAMENTE por containers neutros (divs) até os blocos
+	// reais — a UI embrulha tabelas em horizontal-scroll-wrapper e
+	// table-block-component, e um walk de um nível só as perdia inteiras.
+	const walk = el => {
+		for (const block of el.children) {
+			if (SKIP(block)) continue;
+			const tag = block.tagName.toLowerCase();
+			if (isCodeHost(block)) {
+				if (!pushCode(block) && !pushTable(block)) pushText(block);
+			} else if (isTableBlock(block)) {
+				pushTable(block);
+			} else if (blockTags.has(tag)) {
+				pushText(block);
+			} else if (tag === 'div') {
+				walk(block);
 			}
+			// demais tags (span, custom de enfeite): fora da resposta
 		}
-	}
+	};
+	if (last) walk(last);
 	return parts;
 }`
 

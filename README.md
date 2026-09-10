@@ -327,7 +327,7 @@ bifrost serve     # Start the HTTP API server (default when no command given)
 - **CDP over Puppeteer/Playwright** — pure Go, no Node.js dependency, smaller Docker image
 - **Profile persistence** — Chrome saves the Google session to disk; no re-login on restart
 - **Provider abstraction** — `ProviderFactory`/`LLMWorker` interfaces; ChatGPT web is an experimental second provider (`BIFROST_PROVIDER=chatgpt`)
-- **Structured DOM extraction** — response is extracted as typed parts (text, code, inline code, table), not raw `innerText`, preserving markdown structure accurately
+- **Structured DOM extraction** — the response is extracted as typed parts (text, code, tables, nested lists), not raw `innerText`: code blocks keep language label + pure code, tables become markdown pipes, nested lists keep indentation, inline `code`/`bold`/`italic` keep their markers — all via a recursive walk that pierces the UI's wrapper divs
 
 ---
 
