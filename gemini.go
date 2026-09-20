@@ -233,6 +233,9 @@ var (
 	ErrResponseNotFound  = errors.New("gemini response not found")
 	ErrBrowserClosed     = errors.New("browser closed")
 	ErrGenerationFailed  = errors.New("gemini generation failed (error shown in UI)")
+	// ErrPageUnresponsive: o renderer da página engasgou (conversa/prompt
+	// gigante) e nem o reload destravou — o Evaluate não volta.
+	ErrPageUnresponsive = errors.New("gemini page unresponsive (renderer wedged)")
 )
 
 // maxStickyResponses: acima disso a conversa aderente reabre — conversas
@@ -792,9 +795,29 @@ func (g *Gemini) complete(ctx context.Context, messages []Message, model string,
 		}
 	}()
 
-	state, _, err := GeminiState(runCtx)
+	// verificar sessão com teto curto: página engasgada (conversa/prompt
+	// gigante) pendura o Evaluate no main thread DELA — sem teto, o request
+	// só morria no deadline de 3 minutos do handler. Estourou → ladder de
+	// destravamento: reload (mesma conversa) → página nova via /app (a
+	// conversa gigante re-renderizada volta a engasgar; página nova a
+	// abandona). Nenhum nível veio → o processo do Chromium não executa
+	// comandos — o handler marca o browser para relanço.
+	sessCtx, sessCancel := context.WithTimeout(runCtx, 30*time.Second)
+	state, _, err := GeminiState(sessCtx)
+	sessDead := sessCtx.Err() != nil // deadline bateu (checado antes do cancel)
+	sessCancel()
 	if err != nil {
-		return "", fmt.Errorf("verificar sessão: %w", err)
+		if sessDead && runCtx.Err() == nil && g.ctx.Err() == nil {
+			slog.Warn("página não responde ao probe de sessão em 30s; destravando", "err", err)
+			if ok, _ := g.unwedge(runCtx); ok {
+				// unwedge só devolve ok com probe logado confirmado
+				state, err = stateLoggedIn, nil
+			} else {
+				return "", fmt.Errorf("%w: nem reload nem página nova destravaram a aba", ErrPageUnresponsive)
+			}
+		} else {
+			return "", fmt.Errorf("verificar sessão: %w", err)
+		}
 	}
 	if state != stateLoggedIn {
 		return "", ErrGeminiNotLoggedIn
@@ -820,7 +843,12 @@ func (g *Gemini) complete(ctx context.Context, messages []Message, model string,
 		}
 	}
 
-	now, err := g.generationState(runCtx)
+	// ler estado com teto curto — mesma razão do probe de sessão: Evaluate
+	// em página engasgada pendura; 30s falha rápido em vez de comer o
+	// deadline do request.
+	nowCtx, nowCancel := context.WithTimeout(runCtx, 30*time.Second)
+	now, err := g.generationState(nowCtx)
+	nowCancel()
 	if err != nil {
 		return "", fmt.Errorf("ler estado da conversa: %w", err)
 	}
@@ -925,38 +953,75 @@ func (g *Gemini) complete(ctx context.Context, messages []Message, model string,
 		prompt = SerializeMessages(messages)
 	}
 
-	if err := g.ensureMode(runCtx, mode); err != nil {
-		return "", err
+	// pré-envio (modo + observer + leitura de estado + digitação + envio)
+	// como sequência RE-EXECUTÁVEL com teto próprio de 120s — essas etapas
+	// não podem consumir os 3 minutos do request. Página engasgada no meio
+	// (a digitação de prompt pesado é o ponto clássico: o probe leve de
+	// sessão PASSA, a interação pesada pendura): página NOVA via /app e
+	// recomeço limpo — editor vazio, estado relido.
+	preSubmit := func() (genState, chan streamChunk, bool, error) {
+		pctx, pcancel := context.WithTimeout(runCtx, 120*time.Second)
+		defer pcancel()
+		fail := func(err error) (genState, chan streamChunk, bool, error) {
+			return genState{}, nil, pctx.Err() != nil, err // wedged = o TETO bateu
+		}
+		if err := g.ensureMode(pctx, mode); err != nil {
+			return fail(err)
+		}
+		// observer: injetado ANTES de digitar e depois de TODA navegação
+		// (a navegação destrói o contexto JS da página); se falhar,
+		// streamResponse cai no caminho de polling (ch nil)
+		var ch chan streamChunk
+		if hooks.OnDelta != nil {
+			ch = make(chan streamChunk, 64)
+			g.setStreamCh(ch)
+			var discard string
+			if err := chromedp.Run(pctx, chromedp.Evaluate(observerJS(), &discard)); err != nil {
+				slog.Warn("observer de streaming indisponível; fallback para polling", "err", err)
+				ch = nil
+			}
+		}
+		before, err := g.generationState(pctx)
+		if err != nil {
+			return fail(fmt.Errorf("ler estado da conversa: %w", err))
+		}
+		if err := g.typePrompt(pctx, prompt); err != nil {
+			return fail(err)
+		}
+		if err := g.submit(pctx, before.Responses); err != nil {
+			return fail(err)
+		}
+		return before, ch, false, nil
 	}
+	defer g.setStreamCh(nil) // limpa o último canal que a sequência instalar
 
-	// streaming: registra o canal do observer e o injeta ANTES de digitar —
-	// a navegação (newChat) destrói o contexto JS da página, então a injeção
-	// vem depois de todas as navegações. Se falhar, streamResponse cai no
-	// caminho de polling (ch nil).
-	var streamCh chan streamChunk
-	if hooks.OnDelta != nil {
-		streamCh = make(chan streamChunk, 64)
-		g.setStreamCh(streamCh)
-		defer g.setStreamCh(nil)
-		var discard string
-		if err := chromedp.Run(runCtx, chromedp.Evaluate(observerJS(), &discard)); err != nil {
-			slog.Warn("observer de streaming indisponível; fallback para polling", "err", err)
-			streamCh = nil
+	before, streamCh, wedged, err := preSubmit()
+	if err != nil && wedged && runCtx.Err() == nil && g.ctx.Err() == nil {
+		slog.Warn("pré-envio pendurou (página engasgada); abrindo página nova e recomeçando", "err", err)
+		if g.freshPage(runCtx) {
+			// conversa NOVA: se o prompt era DELTA aderente, ele perdeu o
+			// contexto — redigita o histórico completo
+			prompt = SerializeMessages(messages)
+			if b2, ch2, _, err2 := preSubmit(); err2 == nil {
+				before, streamCh, err = b2, ch2, nil
+			} else {
+				// nem página nova segurou a digitação: devolve o erro da
+				// tentativa (timeout 504) — browser segue na rotação, o
+				// problema é o volume, não o processo
+				slog.Error("pré-envio falhou mesmo com página nova", "err", err2)
+				err = err2
+			}
+		} else {
+			err = fmt.Errorf("%w: página nova não abriu", ErrPageUnresponsive)
 		}
 	}
-
-	before, err := g.generationState(runCtx)
 	if err != nil {
-		return "", fmt.Errorf("ler estado da conversa: %w", err)
-	}
-
-	if err := g.typePrompt(runCtx, prompt); err != nil {
-		return "", err
-	}
-	if err := g.submit(runCtx, before.Responses); err != nil {
 		return "", err
 	}
 	slog.Info("prompt submitted", "chars", len(prompt), "sticky", sticky)
+	if len(prompt) > 120000 {
+		slog.Warn("prompt gigante digitado — página pode engasgar; ajuste BIFROST_TOOL_RESULT_MAX/BIFROST_MAX_PROMPT", "chars", len(prompt))
+	}
 
 	// commit no envio: a conversa agora contém `base`; retratativas (nudge)
 	// enxergam esse estado e emendam a correção na MESMA conversa — o modelo
@@ -1012,6 +1077,79 @@ func commonPrefixLen(a, b string) int {
 		n++
 	}
 	return n
+}
+
+// reloadTab recarrega a aba para destravar um renderer engasgado:
+// Page.reload é comando de BROWSER — não precisa do main thread da página
+// (que está ocupado há minutos com a conversa gigante) e substitui o
+// processo do renderer. A URL (conversa atual) persiste; o estado aderente
+// sobrevive porque a contagem de respostas não muda no re-render.
+func (g *Gemini) reloadTab() error {
+	rctx, cancel := context.WithTimeout(g.ctx, 15*time.Second)
+	defer cancel()
+	if err := chromedp.Run(rctx, chromedp.Reload()); err != nil {
+		return err
+	}
+	return nil
+}
+
+// probeUntilLoggedIn sonda a página em loop (probes de 5s) até responder
+// logada ou o teto esgotar. Página viva responde em <1s; engasgada não
+// responde nunca — o teto é que diferencia.
+func (g *Gemini) probeUntilLoggedIn(runCtx context.Context, wait time.Duration) bool {
+	deadline := time.Now().Add(wait)
+	for time.Now().Before(deadline) && runCtx.Err() == nil && g.ctx.Err() == nil {
+		pctx, cancel := context.WithTimeout(runCtx, 5*time.Second)
+		st, _, serr := GeminiState(pctx)
+		cancel()
+		if serr == nil && st == stateLoggedIn {
+			return true
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return false
+}
+
+// freshPage navega a aba para /app (conversa NOVA, página leve) e reseta o
+// estado aderente. O reload NÃO cura conversa gigante: re-renderiza a
+// mesma conversa e a página volta a engasgar na primeira interação pesada
+// — a página nova abandona a conversa pesada de vez. O custo é o próximo
+// turno redigitar o histórico completo. Devolve false se nem a navegação
+// respondeu (processo do Chromium morto) ou a página nova não veio logada
+// no teto.
+func (g *Gemini) freshPage(runCtx context.Context) bool {
+	nctx, cancel := context.WithTimeout(g.ctx, 15*time.Second)
+	err := chromedp.Run(nctx, chromedp.Navigate(geminiSelectors.URL))
+	cancel()
+	if err != nil {
+		slog.Warn("navegação a página nova falhou — processo do Chromium não responde", "err", err)
+		return false
+	}
+	g.stickyOK = false // conversa abandonada: próximo turno = histórico completo
+	g.dirty = false
+	if g.probeUntilLoggedIn(runCtx, 20*time.Second) {
+		slog.Info("página nova aberta; conversa aderente descartada")
+		return true
+	}
+	return false
+}
+
+// unwedge destrava a aba em níveis crescentes: (1) reload — mantém a
+// conversa e o estado aderente; (2) página nova via /app — descarta a
+// conversa gigante (o reload a re-renderiza e ela re-enge na hora).
+// Devolve (recuperou, páginaNova). false = processo do Chromium não
+// executa comandos — só relançar o browser resolve (marca no gateway).
+func (g *Gemini) unwedge(runCtx context.Context) (recovered, freshPage bool) {
+	if err := g.reloadTab(); err != nil {
+		slog.Warn("reload da aba falhou; indo direto a página nova", "err", err)
+	} else if g.probeUntilLoggedIn(runCtx, 25*time.Second) {
+		slog.Info("aba destravada com reload; conversa preservada")
+		return true, false
+	}
+	if g.freshPage(runCtx) {
+		return true, true
+	}
+	return false, false
 }
 
 // waitForIdle espera a geração em andamento terminar (botão "parar" some).

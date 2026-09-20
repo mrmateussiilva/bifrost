@@ -226,6 +226,13 @@ Gemini Web has no native tool-calling protocol. Bifrost simulates it:
 - Success rate varies (~85-95% without retries; the auto-retry ladder recovers most failures) — the model sometimes ignores tool instructions
 - Token counts are estimated, not exact
 
+**Wedge protection (renderer recovery):** very long agent sessions can wedge the Gemini page's renderer for minutes — every CDP evaluate queues behind it, and before the fix even `/health` and the panel hung together (they probed the page without a deadline). Recovery ladder:
+
+1. **Probe ceilings everywhere**: `/health` and `/panel/data` probe with a 5s cap (a wedged page reports the shard as down instead of hanging the endpoint); the session check carries a 30s cap; the pre-submit sequence (mode switch, typing, submit) has its own 120s ceiling instead of eating the request's 3-minute deadline.
+2. **Tab reload** (Page.reload is a browser-level command — it doesn't need the page's stuck main thread, so it replaces the hung renderer; the conversation URL is preserved).
+3. **Fresh page via /app** when reloading isn't enough — reloading merely re-renders the giant conversation and it re-wedges; a fresh page abandons it and the next turn retypes the history.
+4. **Browser relaunch** when even navigation doesn't respond (the Chrome process itself is dead): the shard is marked suspect and the next acquire restarts the browser, recreating the workers from the persisted profile session.
+
 ---
 
 ## Sticky Conversations (Memory)

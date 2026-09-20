@@ -392,6 +392,8 @@ func handleChat(gw *Gateway) http.HandlerFunc {
 			slog.Error("completion falhou", "err", err)
 			if errors.Is(err, ErrGeminiNotLoggedIn) {
 				gw.markNoSession(shardIdx) // fora da rotação até login
+			} else if errors.Is(err, ErrPageUnresponsive) {
+				gw.markBrowserSuspect(shardIdx) // relanço no próximo acquire
 			}
 			_, _, code, msg := completionErrorInfo(err)
 			thePanel.mutate(rec, func(r *reqRecord) {
@@ -508,6 +510,10 @@ func completionErrorInfo(err error) (status int, errType, code, msg string) {
 	switch {
 	case errors.Is(err, ErrGeminiNotLoggedIn):
 		return http.StatusServiceUnavailable, errAPIError, "gemini_not_logged_in", err.Error()
+	case errors.Is(err, ErrPageUnresponsive):
+		// renderer engasgado (conversa/prompt gigante): 503 — o cliente
+		// pode retentar; o reload da aba já foi tentado dentro do complete
+		return http.StatusServiceUnavailable, errAPIError, "gemini_page_unresponsive", err.Error()
 	case errors.Is(err, ErrBrowserClosed):
 		return http.StatusServiceUnavailable, errAPIError, "browser_closed", err.Error()
 	case errors.Is(err, ErrGenerationTimeout):
@@ -726,6 +732,8 @@ func streamChatCompletion(w http.ResponseWriter, ctx context.Context, gw *Gatewa
 		slog.Error("completion falhou (stream)", "err", err)
 		if errors.Is(err, ErrGeminiNotLoggedIn) {
 			gw.markNoSession(shardIdx) // fora da rotação até login
+		} else if errors.Is(err, ErrPageUnresponsive) {
+			gw.markBrowserSuspect(shardIdx) // relanço no próximo acquire
 		}
 		_, errType, code, msg := completionErrorInfo(err)
 		// rastro completo do erro no painel: código, mensagem e o prompt

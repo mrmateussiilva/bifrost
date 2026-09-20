@@ -41,6 +41,7 @@ type shard struct {
 	workers   []LLMWorker
 	sem       chan int    // tokens de aba (0..poolSize-1)
 	noSession atomic.Bool // sessão ausente: fora da rotação até login
+	suspect   atomic.Bool // browser doente (página que nem reload/navegação destrava): relançar no próximo acquire
 }
 
 // Gateway supervisiona os shards: round-robin com AFINIDADE de conversa
@@ -177,7 +178,7 @@ func (gw *Gateway) tryShard(idx int) (int, LLMWorker, func(), error) {
 	}
 	release := func() { s.sem <- i; gw.poke() }
 	s.mu.Lock()
-	if s.browser == nil || !s.browser.Alive() {
+	if s.browser == nil || !s.browser.Alive() || s.suspect.Load() {
 		if gw.loginActive.Load() && gw.loginShard == idx {
 			s.mu.Unlock()
 			release()
@@ -278,6 +279,7 @@ func (gw *Gateway) recoverShardLocked(s *shard) error {
 		s.workers[i] = gw.factory.NewWorker(tabCtx)
 	}
 	slog.Info("browser up", "profile", s.name, "pool_size", len(s.workers))
+	s.suspect.Store(false) // browser novo: estado limpo
 	return nil
 }
 
@@ -305,8 +307,12 @@ func (gw *Gateway) warmup(ctx context.Context) error {
 		b := s.browser
 		s.mu.Unlock()
 		started++
-		state, _, err := gw.factory.State(b.BootCtx)
-		if err == nil && state != stateLoggedIn {
+		state, err := gw.probeState(b)
+		if err != nil {
+			slog.Warn("warmup: página não respondeu ao probe", "profile", s.name, "err", err)
+			continue
+		}
+		if state != stateLoggedIn {
 			s.noSession.Store(true)
 			slog.Warn("warmup: sessão ausente — login pelo painel", "profile", s.name)
 		}
@@ -329,14 +335,50 @@ func (gw *Gateway) markNoSession(idx int) {
 	}
 }
 
+// markBrowserSuspect marca o browser do shard para RELANÇO no próximo
+// acquire: página que nem reload nem página nova destravaram — o processo
+// do Chromium não executa comandos CDP; só restart resolve. O request que
+// detectou já falhou (503 gemini_page_unresponsive); o próximo acquire
+// fecha e sobe um browser novo (workers recriados, sessão do profile
+// preservada). O shard NÃO sai da rotação: a recuperação é automática.
+func (gw *Gateway) markBrowserSuspect(idx int) {
+	if idx < 0 || idx >= len(gw.shards) {
+		return
+	}
+	s := gw.shards[idx]
+	if !s.suspect.Swap(true) {
+		slog.Warn("browser marcado para relanço (página não destrava nem com reload)", "profile", s.name)
+	}
+}
+
 // queueDepth reporta quantos requests esperam (para o painel).
 func (gw *Gateway) queueDepth() int {
 	return len(gw.queue)
 }
 
+// stateProbeTimeout: teto do probe de estado em status()/warmup. A sonda
+// é um Evaluate na página — se o renderer estiver engasgado (conversa
+// gigante), o Evaluate pendura INDEFINIDAMENTE no BootCtx (sem deadline);
+// sem este teto, /health e /panel/data travavam junto com a página e o
+// gateway inteiro aparentava morte. Var (não const) para encurtar em teste.
+var stateProbeTimeout = 5 * time.Second
+
+// probeState sonda o estado da página com teto curto: página viva → estado
+// real; página engasgada/morta → erro rápido. Quem consome (status, warmup)
+// trata o erro como shard doente em vez de bloquear. O teto deriva do
+// BootCtx (o Evaluate precisa do executor da aba no contexto).
+func (gw *Gateway) probeState(b *Browser) (pageState, error) {
+	pctx, cancel := context.WithTimeout(b.BootCtx, stateProbeTimeout)
+	defer cancel()
+	state, _, err := gw.factory.State(pctx)
+	return state, err
+}
+
 // status agrega a saúde dos shards sem bloquear atrás de geração em
 // andamento. Shards ocupados contam como ok (estão gerando = sessão
-// funciona). Shard sem sessão é marcado — a rotação se auto-cura.
+// funciona). Shard sem sessão é marcado — a rotação se auto-cura. Shard
+// cuja página não responde ao probe (renderer engasgado) conta como DOWN:
+// health/painel devolvem resposta na hora, nunca penduram na página.
 func (gw *Gateway) status() map[string]string {
 	if gw.loginActive.Load() {
 		return map[string]string{"status": "login", "browser": "up"}
@@ -356,13 +398,21 @@ func (gw *Gateway) status() map[string]string {
 		}
 		s.mu.Lock()
 		alive := s.browser != nil && s.browser.Alive()
+		b := s.browser
 		s.mu.Unlock()
-		if !alive {
+		if !alive || b == nil {
 			nDown++
 			continue
 		}
-		state, _, err := gw.factory.State(s.browser.BootCtx)
-		if err != nil || state != stateLoggedIn {
+		state, err := gw.probeState(b)
+		if err != nil {
+			// probe não respondeu no teto: página engasgada conta como down
+			// (o shard segue na rotação — um request pode destravá-lo com
+			// reload; health não pode esperar por isso)
+			nDown++
+			continue
+		}
+		if state != stateLoggedIn {
 			s.noSession.Store(true)
 			nMissing++
 			continue
@@ -518,7 +568,12 @@ func (gw *Gateway) TriggerLogin(idx int) bool {
 				gw.setLoginStatus(LoginStatus{Done: true, Ok: false, Profile: s.name, Message: "Timeout: login não completado em 5 minutos"})
 				return
 			case <-ticker.C:
-				state, _, err := gw.factory.State(b.BootCtx)
+				// probe com teto: página de login engasgada não pode
+				// bloquear o loop (o timeout de 5 minutos precisa seguir
+				// alcançável)
+				pctx, pcancel := context.WithTimeout(b.BootCtx, stateProbeTimeout)
+				state, _, err := gw.factory.State(pctx)
+				pcancel()
 				if err != nil {
 					continue
 				}

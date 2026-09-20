@@ -4,10 +4,42 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 )
 
 func newTestGateway() *Gateway {
 	return NewGateway(context.Background(), Config{PoolSize: 1}, &geminiFactory{})
+}
+
+// blockingFactory: State pendura até o contexto morrer — simula a página
+// engasgada do incidente 2026-09-20 (Evaluate preso no main thread).
+type blockingFactory struct {
+	geminiFactory
+}
+
+func (f *blockingFactory) State(ctx context.Context) (pageState, string, error) {
+	<-ctx.Done()
+	return stateUnknown, "", ctx.Err()
+}
+
+// TestProbeStateTimesOutInsteadOfHanging: sem o teto, o probe de status
+// pendurava /health e /panel/data JUNTO com a página engasgada (dur=2m44s
+// no log do incidente). Com o teto, falha rápido e o status segue.
+func TestProbeStateTimesOutInsteadOfHanging(t *testing.T) {
+	old := stateProbeTimeout
+	stateProbeTimeout = 50 * time.Millisecond
+	defer func() { stateProbeTimeout = old }()
+
+	gw := &Gateway{factory: &blockingFactory{}}
+	b := &Browser{BootCtx: context.Background()}
+	start := time.Now()
+	_, err := gw.probeState(b)
+	if err == nil {
+		t.Fatal("probe com página engasgada deveria devolver erro")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("probe pendurou %v; deveria falhar no teto curto (~50ms)", elapsed)
+	}
 }
 
 func TestStatusDuringPanelLogin(t *testing.T) {
