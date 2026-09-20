@@ -388,6 +388,65 @@ func TestWriteExampleJSON(t *testing.T) {
 	}
 }
 
+func TestDedupeCalls(t *testing.T) {
+	mk := func(name, args string) toolCall {
+		var c toolCall
+		c.Function.Name = name
+		c.Function.Arguments = args
+		return c
+	}
+	calls := []toolCall{
+		mk("read_file", `{"path":"a"}`),
+		mk("read_file", `{"path":"a"}`), // duplicata exata → cai
+		mk("read_file", `{"path":"b"}`), // args diferentes → fica
+		mk("write_file", `{"path":"a"}`),
+	}
+	out := dedupeCalls(calls)
+	if len(out) != 3 {
+		t.Fatalf("esperava 3 chamadas após dedupe, veio %d", len(out))
+	}
+	if out[0].Function.Name != "read_file" || out[1].Function.Arguments != `{"path":"b"}` || out[2].Function.Name != "write_file" {
+		t.Errorf("dedupe alterou a ordem/conteúdo: %+v", out)
+	}
+	if dedupeCalls(calls[:1]) == nil || len(dedupeCalls(calls[:1])) != 1 {
+		t.Error("dedupe de chamada única não deveria mudar nada")
+	}
+}
+
+func TestLooksLikeMissedToolCallTwoGates(t *testing.T) {
+	tools := testToolDefs()
+
+	// positivo: abertura conversativa + corpo com fence (arquivo exibido)
+	withFence := "Claro! Aqui está a documentação do projeto:\n\n```markdown\n# Meu Projeto\n\nBem-vindo ao projeto. Esta documentação cobre a instalação, o uso diário e as perguntas mais frequentes.\n```\n"
+	if !looksLikeMissedToolCall(withFence, tools) {
+		t.Error("exibição de arquivo com fence deveria ser detectada")
+	}
+
+	// positivo: heading direto no corpo
+	withHeading := "# Meu Projeto\n\nBem-vindo ao projeto. Esta documentação cobre a instalação, o uso diário e as perguntas mais frequentes que os usuários costumam ter.\n"
+	if !looksLikeMissedToolCall(withHeading, tools) {
+		t.Error("exibição de arquivo com heading deveria ser detectada")
+	}
+
+	// negativo: abertura conversativa + explicação SEM cara de arquivo —
+	// antes deste gate tomava retratativa à toa
+	chatty := "Claro! Vamos criar o arquivo de documentação. Primeiro, é importante entender o objetivo do projeto e o público-alvo; depois disso, a estrutura do documento fica clara e a escrita flui naturalmente até o fim."
+	if looksLikeMissedToolCall(chatty, tools) {
+		t.Error("resposta conversativa sem corpo de arquivo não deveria ser detectada")
+	}
+
+	// negativo: curto demais
+	if looksLikeMissedToolCall("Aqui está:\n```js\nx\n```", tools) {
+		t.Error("resposta curta não deveria ser detectada")
+	}
+
+	// negativo: sem ferramentas de escrita declaradas
+	noWrite := []toolDef{tools[0]}
+	if looksLikeMissedToolCall(withFence, noWrite) {
+		t.Error("sem ferramenta de escrita declarada não há missed tool call")
+	}
+}
+
 func TestModelObjects(t *testing.T) {
 	gw := &Gateway{factory: &geminiFactory{}}
 	models := gw.factory.Models()

@@ -410,17 +410,32 @@ func handleChat(gw *Gateway) http.HandlerFunc {
 		calls, content, _ := parseToolCalls(text, declared)
 
 		// recusa probabilística do Gemini web: sem chamada e abrindo com
-		// recusa, re-executa UMA vez com correção (a geração recusada fica
-		// no vácuo — conversa nova a cada requisição)
+		// recusa, re-executa com correção — a geração recusada fica no
+		// vácuo (conversa nova a cada requisição). Ladder igual ao do
+		// streaming: segunda recusa ganha uma última tentativa, cujo
+		// resultado é aceito como vier (o agente reage à recusa visível).
+		// Chamada como texto puro NÃO tem retratativa aqui: o parser final
+		// extrai o JSON bruto de qualquer posição (scanRawToolCalls).
 		if len(calls) == 0 && len(req.Tools) > 0 && looksLikeRefusal(content) {
 			slog.Warn("recusa de ferramenta detectada; retentando com correção")
 			thePanel.noteRetry(rec)
-			retryMsgs := make([]Message, 0, len(msgs)+1)
-			retryMsgs = append(retryMsgs, msgs...)
-			retryMsgs = append(retryMsgs, Message{Role: "system", Content: refusalCorrection, Nudge: true})
+			retryMsgs := append(append(make([]Message, 0, len(msgs)+1), msgs...),
+				Message{Role: "system", Content: refusalCorrection, Nudge: true})
 			if text2, err2 := g.Complete(ctx, retryMsgs, req.Model); err2 == nil {
 				calls2, content2, _ := parseToolCalls(text2, declared)
-				text, calls, content = text2, calls2, content2
+				if len(calls2) == 0 && looksLikeRefusal(content2) {
+					slog.Warn("recusa persistente; última tentativa sem inspeção")
+					thePanel.noteRetry(rec)
+					// mesma correção, resultado aceito como vier — espelha
+					// o ladder do streaming (a última tentativa lá também
+					// reusa as mensagens, só desliga a inspeção)
+					if text3, err3 := g.Complete(ctx, retryMsgs, req.Model); err3 == nil {
+						calls3, content3, _ := parseToolCalls(text3, declared)
+						text, calls, content = text3, calls3, content3
+					}
+				} else {
+					text, calls, content = text2, calls2, content2
+				}
 			}
 		}
 
@@ -430,14 +445,15 @@ func handleChat(gw *Gateway) http.HandlerFunc {
 		if len(calls) == 0 && len(req.Tools) > 0 && looksLikeMissedToolCall(content, req.Tools) {
 			slog.Warn("modelo gerou texto em vez de chamar ferramenta de escrita; retentando")
 			thePanel.noteRetry(rec)
-			retryMsgs := make([]Message, 0, len(msgs)+1)
-			retryMsgs = append(retryMsgs, msgs...)
-			retryMsgs = append(retryMsgs, Message{Role: "system", Content: missedToolCallCorrection, Nudge: true})
+			retryMsgs := append(append(make([]Message, 0, len(msgs)+1), msgs...),
+				Message{Role: "system", Content: missedToolCallCorrection, Nudge: true})
 			if text2, err2 := g.Complete(ctx, retryMsgs, req.Model); err2 == nil {
 				calls2, content2, _ := parseToolCalls(text2, declared)
 				text, calls, content = text2, calls2, content2
 			}
 		}
+
+		calls = dedupeCalls(calls)
 
 		if len(calls) > 0 {
 			slog.Info("tool calls parsed", "calls", len(calls))
@@ -1043,6 +1059,28 @@ Regras:
 	return b.String()
 }
 
+// dedupeCalls descarta chamadas idênticas na MESMA resposta (mesma
+// ferramenta E mesmos argumentos): o bug clássico do Gemini web re-emite
+// a chamada cujo resultado ainda não voltou; executá-la duas vezes só
+// desperdiça um turno do agente. A primeira ocorrência fica.
+func dedupeCalls(calls []toolCall) []toolCall {
+	if len(calls) < 2 {
+		return calls
+	}
+	seen := make(map[string]bool, len(calls))
+	out := make([]toolCall, 0, len(calls))
+	for _, c := range calls {
+		key := c.Function.Name + "\x00" + c.Function.Arguments
+		if seen[key] {
+			slog.Warn("chamada duplicada descartada", "tool", c.Function.Name)
+			continue
+		}
+		seen[key] = true
+		out = append(out, c)
+	}
+	return out
+}
+
 // multiTurnToolInstruction: apêndice ao protocolo quando o histórico já
 // contém resultados [TOOL] — sem ele, o modelo tende a repetir chamadas
 // cujo resultado já chegou, travando o loop do agente.
@@ -1452,22 +1490,37 @@ func hasWriteTools(tools []toolDef) bool {
 
 // looksLikeMissedToolCall: o modelo gerou uma resposta longa de texto puro
 // (sem chamada de ferramenta) quando existem ferramentas de escrita
-// disponíveis. Heurística: resposta >= 150 chars E começa com título markdown
-// ou frase introdutória comum de documentação/código.
+// disponíveis. Heurística de DOIS gates para não queimar ~6s de
+// retratativa em resposta legítima: (1) abertura conversativa/título
+// (regex) e >= 150 chars; (2) CORPO com cara de arquivo exibido — fence
+// de código ou título markdown em linha própria. Sem o segundo gate,
+// "claro, vamos fazer X" + explicação tomava retratativa à toa.
 var missedToolCallRe = regexp.MustCompile(`(?i)^(#|##|###|aqui (está|estão)|here (is|are)|claro|certo|ok,|of course|sure,|vou criar|vou escrever|segue|abaixo)`)
+
+// missedToolBodyRe: evidência de conteúdo de arquivo exibido como texto —
+// fence de código ou título markdown iniciando linha.
+var missedToolBodyRe = regexp.MustCompile("(?m)(^```|^#{1,3} \\S)")
 
 func looksLikeMissedToolCall(content string, tools []toolDef) bool {
 	if !hasWriteTools(tools) {
 		return false
 	}
-	if len(strings.TrimSpace(content)) < 150 {
+	c := strings.TrimSpace(content)
+	if len(c) < 150 {
 		return false
 	}
-	prefix := content
+	prefix := c
 	if len(prefix) > 200 {
 		prefix = prefix[:200]
 	}
-	return missedToolCallRe.MatchString(strings.TrimSpace(prefix))
+	if !missedToolCallRe.MatchString(strings.TrimSpace(prefix)) {
+		return false
+	}
+	body := c
+	if len(body) > 600 {
+		body = body[:600]
+	}
+	return missedToolBodyRe.MatchString(body)
 }
 
 // refusalRe casa as formulações de recusa de acesso/capacidade (pt e en),

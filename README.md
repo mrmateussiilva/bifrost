@@ -214,8 +214,9 @@ Gemini Web has no native tool-calling protocol. Bifrost simulates it:
 - `function.strict: true` (exact-schema adherence, instructed)
 - Multi-turn tool use (tool results passed as `tool` role messages), with an anti-repeat instruction when results are already in the history
 - `content` as string, `null`, or multi-part array (`[{"type":"text","text":"..."}]`) — modern clients and bridges work out of the box
-- Auto-retry with correction when the model: refuses to use tools, answers with prose instead of calling a write tool, or emits the call as loose JSON instead of a code block
+- Auto-retry with correction when the model: refuses to use tools (two-step ladder in stream and non-stream), answers with prose instead of calling a write tool, or emits the call as loose JSON instead of a code block
 - Robust parsing: literal newlines repaired, stringified arguments unwrapped, `{"tool_call": {...}}`-style wrappers unwrapped, calls scanned outside code blocks as a last resort
+- Exact-duplicate calls within one response are dropped (the classic Gemini Web repeat bug)
 
 **Prompt protocol:** tool schemas are rendered with their required parameters listed explicitly, and the one-shot example uses a real tool from the request (with type-correct placeholder arguments synthesized from its schema) — including a dedicated wrong-vs-right example for write tools citing the actual write tool name.
 
