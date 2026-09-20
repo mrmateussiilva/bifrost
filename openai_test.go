@@ -272,6 +272,122 @@ func TestSerializeToolsMultiTurnInstruction(t *testing.T) {
 	}
 }
 
+func testToolDefs() []toolDef {
+	var read, write toolDef
+	read.Function.Name = "read_file"
+	read.Function.Description = "lê um arquivo do disco"
+	read.Function.Parameters = json.RawMessage(`{"type":"object","required":["path"],"properties":{"path":{"type":"string"}}}`)
+	write.Function.Name = "write_file"
+	write.Function.Description = "escreve um arquivo no disco"
+	write.Function.Parameters = json.RawMessage(`{"type":"object","required":["path","content"],"properties":{"path":{"type":"string"},"content":{"type":"string"}}}`)
+	return []toolDef{read, write}
+}
+
+func TestSerializeToolsRealToolExample(t *testing.T) {
+	out := serializeTools(testToolDefs(), nil, true, false)
+	// exemplo com ferramenta REAL (com required) — não hipotética
+	if !strings.Contains(out, "Exemplo de interação correta com read_file") {
+		t.Error("exemplo deveria citar a ferramenta real read_file")
+	}
+	if !strings.Contains(out, `"name": "read_file"`) {
+		t.Error("exemplo deveria conter a chamada JSON da ferramenta real")
+	}
+	// obrigatórios explícitos por ferramenta
+	if !strings.Contains(out, "parâmetros OBRIGATÓRIOS: path") {
+		t.Error("lista de obrigatórios ausente para read_file")
+	}
+	if !strings.Contains(out, "parâmetros OBRIGATÓRIOS: path, content") {
+		t.Error("lista de obrigatórios ausente para write_file")
+	}
+	// exemplo crítico cita a ferramenta de escrita real
+	if !strings.Contains(out, "criação de arquivo com write_file") {
+		t.Error("exemplo crítico deveria citar write_file")
+	}
+	// diretriz de paralelismo
+	if !strings.Contains(out, "Chamadas INDEPENDENTES") {
+		t.Error("diretriz de paralelismo ausente com parallelOK=true")
+	}
+	// strict fora quando nenhuma tool pede
+	if strings.Contains(out, "Aderência ESTRITA") {
+		t.Error("diretriz strict não deveria aparecer sem strict:true")
+	}
+}
+
+func TestSerializeToolsParallelDisabledAndStrict(t *testing.T) {
+	tools := testToolDefs()
+	tools[1].Function.Strict = true
+
+	out := serializeTools(tools, nil, false, true)
+	if !strings.Contains(out, "NO MÁXIMO UMA chamada") {
+		t.Error("parallel_tool_calls=false deveria trocar a diretriz por 'no máximo uma'")
+	}
+	if strings.Contains(out, "Chamadas INDEPENDENTES") {
+		t.Error("diretriz de paralelismo não deveria aparecer com parallelOK=false")
+	}
+	if !strings.Contains(out, "Aderência ESTRITA ao schema") {
+		t.Error("strict:true deveria acrescentar a diretriz de aderência")
+	}
+}
+
+func TestSerializeToolsToolChoiceDirective(t *testing.T) {
+	out := serializeTools(testToolDefs(), json.RawMessage(`"required"`), true, false)
+	if !strings.Contains(out, "DEVE chamar pelo menos uma") {
+		t.Error("tool_choice=required sem diretiva correspondente")
+	}
+	out = serializeTools(testToolDefs(), json.RawMessage(`{"type":"function","function":{"name":"write_file"}}`), true, false)
+	if !strings.Contains(out, "DEVE chamar a ferramenta write_file") {
+		t.Error("tool_choice específico sem diretiva correspondente")
+	}
+}
+
+func TestRequiredParamsAndExampleArgs(t *testing.T) {
+	if req := requiredParams(json.RawMessage(`{"required":["a","b"]}`)); len(req) != 2 || req[0] != "a" || req[1] != "b" {
+		t.Errorf("requiredParams = %v; want [a b]", req)
+	}
+	if req := requiredParams(nil); req != nil {
+		t.Errorf("requiredParams(nil) = %v; want nil", req)
+	}
+	if req := requiredParams(json.RawMessage(`{invalid`)); req != nil {
+		t.Errorf("requiredParams(schema inválido) = %v; want nil", req)
+	}
+
+	schema := json.RawMessage(`{"type":"object","required":["path","n","flag"],"properties":{"path":{"type":"string"},"n":{"type":"integer"},"flag":{"type":"boolean"}}}`)
+	got := exampleArgs(schema)
+	var m map[string]any
+	if err := json.Unmarshal([]byte(got), &m); err != nil {
+		t.Fatalf("exampleArgs não produziu JSON válido: %v (%s)", err, got)
+	}
+	if m["path"] != "VALOR" || m["n"] != float64(1) || m["flag"] != true {
+		t.Errorf("placeholders por tipo errados: %s", got)
+	}
+	// sem required: dois primeiros props
+	got = exampleArgs(json.RawMessage(`{"type":"object","properties":{"zebra":{"type":"string"},"alpha":{"type":"number"},"beta":{"type":"string"}}}`))
+	if !strings.Contains(got, `"alpha"`) || !strings.Contains(got, `"beta"`) {
+		t.Errorf("exampleArgs sem required deveria usar os dois primeiros props (ordem alfabética): %s", got)
+	}
+}
+
+func TestWriteExampleJSON(t *testing.T) {
+	var strReplace toolDef
+	strReplace.Function.Name = "str_replace_editor"
+	strReplace.Function.Parameters = json.RawMessage(`{"type":"object","required":["command","path","file_str"],"properties":{"command":{"type":"string"},"path":{"type":"string"},"file_str":{"type":"string"}}}`)
+	got := writeExampleJSON(strReplace)
+	// content-like recebe markdown com escape visível — a lição de escape
+	// dentro de arguments (json.Marshal escapa o \n real para "\n")
+	if !strings.Contains(got, `"file_str":"# Meu Projeto\n..."`) {
+		t.Errorf("content-like deveria receber markdown com escape: %s", got)
+	}
+	if !strings.Contains(got, `"path":"docs/README.md"`) {
+		t.Errorf("path-like deveria receber docs/README.md: %s", got)
+	}
+	if !strings.Contains(got, `"command":"VALOR"`) {
+		t.Errorf("parâmetro neutro deveria receber placeholder do tipo: %s", got)
+	}
+	if !strings.HasPrefix(got, `{"name": "str_replace_editor",`) {
+		t.Errorf("exemplo deveria nomear a ferramenta real: %s", got)
+	}
+}
+
 func TestModelObjects(t *testing.T) {
 	gw := &Gateway{factory: &geminiFactory{}}
 	models := gw.factory.Models()

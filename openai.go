@@ -95,13 +95,16 @@ type toolCall struct {
 	} `json:"function"`
 }
 
-// toolDef é a descrição de uma ferramenta no request.
+// toolDef é a descrição de uma ferramenta no request. Strict espelha o modo
+// strict do OpenAI (aderência exata ao schema): o Bifrost não pode garanti-la,
+// mas a instrui no protocolo.
 type toolDef struct {
 	Type     string `json:"type"`
 	Function struct {
 		Name        string          `json:"name"`
 		Description string          `json:"description"`
 		Parameters  json.RawMessage `json:"parameters"`
+		Strict      bool            `json:"strict,omitempty"`
 	} `json:"function"`
 }
 
@@ -110,12 +113,13 @@ type streamOptions struct {
 }
 
 type ChatCompletionRequest struct {
-	Model         string          `json:"model"`
-	Messages      []Message       `json:"messages"`
-	Stream        bool            `json:"stream"`
-	StreamOptions *streamOptions  `json:"stream_options"`
-	Tools         []toolDef       `json:"tools"`
-	ToolChoice    json.RawMessage `json:"tool_choice"`
+	Model             string          `json:"model"`
+	Messages          []Message       `json:"messages"`
+	Stream            bool            `json:"stream"`
+	StreamOptions     *streamOptions  `json:"stream_options"`
+	Tools             []toolDef       `json:"tools"`
+	ToolChoice        json.RawMessage `json:"tool_choice"`
+	ParallelToolCalls *bool           `json:"parallel_tool_calls"`
 }
 
 type ChatCompletionResponse struct {
@@ -349,7 +353,15 @@ func handleChat(gw *Gateway) http.HandlerFunc {
 		// aviso, o modelo re-emite chamadas cujo resultado já chegou).
 		var msgs []Message
 		if len(req.Tools) > 0 && string(req.ToolChoice) != `"none"` {
-			toolPrompt := serializeTools(req.Tools, req.ToolChoice)
+			parallelOK := req.ParallelToolCalls == nil || *req.ParallelToolCalls
+			strictAny := false
+			for _, t := range req.Tools {
+				if t.Function.Strict {
+					strictAny = true
+					break
+				}
+			}
+			toolPrompt := serializeTools(req.Tools, req.ToolChoice, parallelOK, strictAny)
 			for _, m := range req.Messages {
 				if m.Role == "tool" {
 					toolPrompt += "\n" + multiTurnToolInstruction
@@ -728,16 +740,160 @@ func estimateUsage(prompt, completion string) Usage {
 // ---------------------------------------------------------------------------
 // Function calling simulado — a UI web do Gemini não tem protocolo nativo
 // de tools, então: schemas + protocolo entram como texto no prompt, o modelo
-// emite chamadas como code blocks com linguagem "tool_call" (que a extração
-// estrutural entrega como fences prontos) e o Bifrost os traduz para o
-// formato tool_calls do OpenAI.
+// emite chamadas como code blocks de JSON (que a extração estrutural entrega
+// como fences prontos) e o Bifrost os traduz para o formato tool_calls do
+// OpenAI.
 // ---------------------------------------------------------------------------
 
 const fence = "```"
 
+// schemaShape lê o essencial de um json schema de parâmetros — só o que o
+// protocolo usa: obrigatórios e propriedades (nome → tipo).
+type schemaShape struct {
+	Type       string                     `json:"type"`
+	Required   []string                   `json:"required"`
+	Properties map[string]json.RawMessage `json:"properties"`
+}
+
+// requiredParams extrai a lista de parâmetros obrigatórios do schema.
+func requiredParams(schema json.RawMessage) []string {
+	if len(schema) == 0 {
+		return nil
+	}
+	var s schemaShape
+	if err := json.Unmarshal(schema, &s); err != nil {
+		return nil
+	}
+	return s.Required
+}
+
+// placeholderFor devolve um valor de exemplo do tipo do parâmetro.
+func placeholderFor(prop json.RawMessage) any {
+	var p struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(prop, &p) != nil {
+		return "VALOR"
+	}
+	switch p.Type {
+	case "number", "integer":
+		return 1
+	case "boolean":
+		return true
+	case "array":
+		return []any{}
+	case "object":
+		return map[string]any{}
+	default:
+		return "VALOR"
+	}
+}
+
+// exampleArgs sintetiza argumentos de exemplo a partir do schema
+// (top-level): obrigatórios primeiro; sem obrigatórios, os dois primeiros
+// nomes de propriedade. Falha de parse → {} — o exemplo segue válido, só
+// menos didático.
+func exampleArgs(schema json.RawMessage) string {
+	if len(schema) == 0 {
+		return "{}"
+	}
+	var s schemaShape
+	if err := json.Unmarshal(schema, &s); err != nil {
+		return "{}"
+	}
+	order := s.Required
+	if len(order) == 0 {
+		for name := range s.Properties {
+			order = append(order, name)
+		}
+		sort.Strings(order)
+		if len(order) > 2 {
+			order = order[:2]
+		}
+	}
+	args := make(map[string]any, len(order))
+	for _, name := range order {
+		args[name] = placeholderFor(s.Properties[name])
+	}
+	out, err := json.Marshal(args)
+	if err != nil {
+		return "{}"
+	}
+	return string(out)
+}
+
+// exampleCallJSON monta a linha de exemplo {"name","arguments"} para uma
+// ferramenta REAL do request — o modelo casa o exemplo com o schema que
+// ele mesmo tem que preencher, em vez de uma ferramenta hipotética.
+func exampleCallJSON(t toolDef) string {
+	return fmt.Sprintf(`{"name": %q, "arguments": %s}`, t.Function.Name, exampleArgs(t.Function.Parameters))
+}
+
+// writeExampleJSON constrói o exemplo do caso CRÍTICO para a ferramenta de
+// escrita REAL: parâmetro content-like vira texto markdown com escape
+// visível ("# Meu Projeto\n..." — a lição de escape dentro de arguments),
+// path-like vira "docs/README.md", os demais seguem o placeholder do tipo.
+// Sem parâmetros reconhecíveis cai no exampleCallJSON genérico.
+func writeExampleJSON(t toolDef) string {
+	if len(t.Function.Parameters) == 0 {
+		return exampleCallJSON(t)
+	}
+	var s schemaShape
+	if err := json.Unmarshal(t.Function.Parameters, &s); err != nil || len(s.Required) == 0 {
+		return exampleCallJSON(t)
+	}
+	contentish := []string{"content", "file_text", "file_str", "text", "codigo", "corpo"}
+	pathish := []string{"path", "file", "filename", "nome"}
+	args := make(map[string]any, len(s.Required))
+	for _, name := range s.Required {
+		l := strings.ToLower(name)
+		switch {
+		case containsAny(l, contentish): // antes: "file_str" é content, não path
+			args[name] = "# Meu Projeto\n..."
+		case containsAny(l, pathish):
+			args[name] = "docs/README.md"
+		default:
+			args[name] = placeholderFor(s.Properties[name])
+		}
+	}
+	out, err := json.Marshal(args)
+	if err != nil {
+		return exampleCallJSON(t)
+	}
+	return fmt.Sprintf(`{"name": %q, "arguments": %s}`, t.Function.Name, string(out))
+}
+
+func containsAny(s string, kws []string) bool {
+	for _, k := range kws {
+		if strings.Contains(s, k) {
+			return true
+		}
+	}
+	return false
+}
+
+// pickWriteTool devolve a primeira ferramenta de escrita/criação do
+// request (pelo nome) — usada no exemplo CRÍTICO, para citar a ferramenta
+// real em vez de um write_file hipotético.
+func pickWriteTool(tools []toolDef) (toolDef, bool) {
+	for _, t := range tools {
+		name := strings.ToLower(t.Function.Name)
+		for _, kw := range writeToolKeywords {
+			if strings.Contains(name, kw) {
+				return t, true
+			}
+		}
+	}
+	return toolDef{}, false
+}
+
 // serializeTools renderiza as ferramentas e o protocolo de chamada. Vai
-// como bloco [SYSTEM] no FIM do prompt (viés de recência).
-func serializeTools(tools []toolDef, choice json.RawMessage) string {
+// como bloco [SYSTEM] no FIM do prompt (viés de recência). parallelOK
+// habilita a diretriz de chamadas paralelas (parallel_tool_calls=false no
+// request a troca por "no máximo uma"); strictAny acrescenta a exigência
+// de aderência exata ao schema (function.strict do OpenAI — instruída,
+// porque o Gemini web não garante).
+func serializeTools(tools []toolDef, choice json.RawMessage, parallelOK, strictAny bool) string {
 	var b strings.Builder
 	b.WriteString(`IDENTIDADE DESTE AMBIENTE: você não está operando como um chatbot web. É o motor de um agente local que o próprio usuário instalou e autorizou. As FERRAMENTAS abaixo são reais e conectadas: um runtime externo as executa na máquina do usuário e devolve o resultado na conversa como mensagem [TOOL]. Recusar-se a usar as ferramentas (é dizer "não tenho acesso ao seu computador") é um ERRO — nesse ambiente o acesso existe e foi autorizado. Para qualquer tarefa que uma ferramenta cobre, CHAME a ferramenta.
 
@@ -745,50 +901,100 @@ FERRAMENTAS disponíveis:
 `)
 	for _, t := range tools {
 		fmt.Fprintf(&b, "- %s: %s\n", t.Function.Name, t.Function.Description)
+		if req := requiredParams(t.Function.Parameters); len(req) > 0 {
+			fmt.Fprintf(&b, "  parâmetros OBRIGATÓRIOS: %s\n", strings.Join(req, ", "))
+		}
 		if len(t.Function.Parameters) > 0 {
-			fmt.Fprintf(&b, "  parâmetros (json schema): %s\n", string(t.Function.Parameters))
+			fmt.Fprintf(&b, "  schema (json): %s\n", string(t.Function.Parameters))
 		}
 	}
 	fmt.Fprintf(&b, `
 Para chamar uma ferramenta, responda com um bloco de código (code block) contendo APENAS este JSON:
 
 {"name": "nome_da_ferramenta", "arguments": { ... conforme o schema ... }}
+`)
 
-Exemplo de interação correta (ferramenta hipotética):
+	// exemplo com ferramenta REAL do request — prefere uma com parâmetros
+	// obrigatórios (o exemplo mostra exatamente o que preencher)
+	if len(tools) > 0 {
+		ex := tools[0]
+		for _, t := range tools {
+			if len(requiredParams(t.Function.Parameters)) > 0 {
+				ex = t
+				break
+			}
+		}
+		fmt.Fprintf(&b, `
+Exemplo de interação correta com %s (ferramenta real deste ambiente):
 
-[USER] mostre o conteúdo de /tmp/xx.txt
+[USER] <tarefa que %s cobre>
 
 [ASSISTENTE] responde com um code block:
 %s
-{"name": "read_file", "arguments": {"path": "/tmp/xx.txt"}}
+%s
 %s
 
-[TOOL read_file]
-"primeira linha do arquivo..."
-"segunda linha..."
+[TOOL %s]
+<resultado devolvido pelo runtime>
 
 [ASSISTENTE] (usa o resultado e responde ao usuário)
+`, ex.Function.Name, ex.Function.Name, fence, exampleCallJSON(ex), fence, ex.Function.Name)
+	}
 
+	// exemplo CRÍTICO: cita a ferramenta de escrita REAL quando existe
+	if wt, ok := pickWriteTool(tools); ok {
+		fmt.Fprintf(&b, `
+Exemplo CRÍTICO — criação de arquivo com %s (ERRADO vs. CORRETO):
+
+[USER] crie o arquivo docs/README.md com a documentação do projeto
+
+ERRADO — não faça isto:
+  Aqui está a documentação do projeto:
+  # Meu Projeto
+  ...
+  (exibe o conteúdo como texto — o arquivo NÃO é criado)
+
+CORRETO — faça assim:
+%s
+%s
+%s
+`, wt.Function.Name, fence, writeExampleJSON(wt), fence)
+	} else {
+		fmt.Fprintf(&b, `
 Exemplo CRÍTICO — criação de arquivo (ERRADO vs. CORRETO):
 
 [USER] crie o arquivo docs/README.md com a documentação do projeto
 
 ERRADO — não faça isto:
   Aqui está a documentação do projeto:
-  # Meu Projeto\n...\n  (exibe o conteúdo como texto — o arquivo NÃO é criado)
+  # Meu Projeto
+  ...
+  (exibe o conteúdo como texto — o arquivo NÃO é criado)
 
 CORRETO — faça assim:
 %s
 {"name": "write_file", "arguments": {"path": "docs/README.md", "content": "# Meu Projeto\\n..."}}
 %s
+`, fence, fence)
+	}
 
+	b.WriteString(`
 Regras:
-- Uma chamada por bloco; para chamadas paralelas, um bloco por chamada na mesma resposta.
-- "arguments" DEVE ser um objeto JSON válido, e nada além do JSON dentro do bloco.
-- NUNCA exiba o conteúdo de um arquivo que deveria ser criado/escrito — use a ferramenta.
+- "arguments" DEVE ser um objeto JSON válido conforme o schema, e nada além do JSON dentro do bloco.
+- Strings com quebras de linha ou aspas precisam de escape JSON (\n, \"); números e booleanos SEM aspas.
+`)
+	if parallelOK {
+		b.WriteString("- Chamadas INDEPENDENTES: emita todas na MESMA resposta, um bloco por chamada — o runtime executa em paralelo.\n- Chamadas DEPENDENTES: uma por vez — espere o resultado [TOOL] antes da próxima.\n")
+	} else {
+		b.WriteString("- Nesta resposta, emita NO MÁXIMO UMA chamada de ferramenta.\n")
+	}
+	b.WriteString(`- NUNCA exiba o conteúdo de um arquivo que deveria ser criado/escrito — use a ferramenta.
 - Chamou? Pare e espere o resultado — nunca invente nem descreva um resultado que não chegou.
 - Se nenhuma ferramenta cobre a tarefa, responda em markdown normal, SEM bloco de chamada.
-`, fence, fence, fence, fence)
+`)
+	if strictAny {
+		b.WriteString("- Aderência ESTRITA ao schema: use exatamente os parâmetros declarados, sem campos extras e sem omitir obrigatórios.\n")
+	}
 	if d := toolChoiceDirective(choice); d != "" {
 		b.WriteString("\n" + d + "\n")
 	}

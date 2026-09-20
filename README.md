@@ -159,6 +159,8 @@ Standard OpenAI chat completions endpoint. Supports:
 - `stream` — `true` for SSE streaming, `false` for batch
 - `tools` — function definitions (simulated, see below)
 - `tool_choice` — `"auto"`, `"required"`, or `{"type":"function","function":{"name":"..."}}`
+- `parallel_tool_calls` — `false` instructs the model to emit at most one call per response
+- `function.strict: true` — instructs exact-schema adherence (instructed, not guaranteed: Gemini Web has no native tool protocol)
 
 **Request:**
 
@@ -208,10 +210,14 @@ Gemini Web has no native tool-calling protocol. Bifrost simulates it:
 - Single and parallel tool calls — including multiple JSON objects inside one code block
 - `tool_choice: "required"` (model is instructed to always call a tool)
 - `tool_choice: {"type":"function","function":{"name":"..."}}` (specific tool)
+- `parallel_tool_calls: false` (at most one call per response)
+- `function.strict: true` (exact-schema adherence, instructed)
 - Multi-turn tool use (tool results passed as `tool` role messages), with an anti-repeat instruction when results are already in the history
 - `content` as string, `null`, or multi-part array (`[{"type":"text","text":"..."}]`) — modern clients and bridges work out of the box
 - Auto-retry with correction when the model: refuses to use tools, answers with prose instead of calling a write tool, or emits the call as loose JSON instead of a code block
 - Robust parsing: literal newlines repaired, stringified arguments unwrapped, `{"tool_call": {...}}`-style wrappers unwrapped, calls scanned outside code blocks as a last resort
+
+**Prompt protocol:** tool schemas are rendered with their required parameters listed explicitly, and the one-shot example uses a real tool from the request (with type-correct placeholder arguments synthesized from its schema) — including a dedicated wrong-vs-right example for write tools citing the actual write tool name.
 
 **Streaming behavior:** tool-call-shaped code blocks (JSON starting with `{`) are withheld from the content stream and translated to `delta.tool_calls` at the end — they never leak as text.
 
