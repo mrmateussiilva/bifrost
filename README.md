@@ -219,7 +219,7 @@ Gemini Web has no native tool-calling protocol. Bifrost simulates it:
 
 **Prompt protocol:** tool schemas are rendered with their required parameters listed explicitly, and the one-shot example uses a real tool from the request (with type-correct placeholder arguments synthesized from its schema) — including a dedicated wrong-vs-right example for write tools citing the actual write tool name.
 
-**Streaming behavior:** tool-call-shaped code blocks (JSON starting with `{`) are withheld from the content stream and translated to `delta.tool_calls` at the end — they never leak as text.
+**Streaming behavior:** tool-call-shaped code blocks (JSON starting with `{`) are withheld from the content stream and translated to `delta.tool_calls` — **emitted early**, as soon as a call block closes and stabilizes mid-generation (the client can start executing the first call while the rest of the response still generates), with the remainder translated at the end. Index assignment is shared between early and final emission; already-emitted calls are never re-sent, and call blocks never leak as text.
 
 **Known limitations:**
 - Success rate varies (~85-95% without retries; the auto-retry ladder recovers most failures) — the model sometimes ignores tool instructions

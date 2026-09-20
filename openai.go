@@ -535,12 +535,15 @@ func (s *sseWriter) raw(msg string) {
 }
 
 // streamChatCompletion responde em SSE: chunk de papel, chunks de conteúdo
-// conforme a geração avança, chunk final com finish_reason, usage opcional
-// (stream_options.include_usage) e [DONE]. Chamadas de ferramenta chegam
-// como chunks delta.tool_calls (os fences tool_call nunca vazam como
-// conteúdo — o loop de streaming os retém). Erros ANTES do primeiro byte
-// saem como status HTTP normais; depois dele, como evento de erro + [DONE]
-// — o protocolo não permite trocar o status no meio do stream.
+// conforme a geração avança, chunks delta.tool_calls — precoces, assim que
+// um bloco de chamada fecha e estabiliza no meio da geração (Classify +
+// OnToolCall), e o restante na tradução final — chunk final com
+// finish_reason, usage opcional (stream_options.include_usage) e [DONE].
+// Os fences de chamada nunca vazam como conteúdo (o loop de streaming os
+// retém); blocos com forma de chamada mas nome não-declarado chegam como
+// delta tardio. Erros ANTES do primeiro byte saem como status HTTP
+// normais; depois dele, como evento de erro + [DONE] — o protocolo não
+// permite trocar o status no meio do stream.
 func streamChatCompletion(w http.ResponseWriter, ctx context.Context, gw *Gateway, shardIdx int, g LLMWorker, req ChatCompletionRequest, msgs []Message, promptText string, rec *reqRecord) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -575,23 +578,47 @@ func streamChatCompletion(w http.ResponseWriter, ctx context.Context, gw *Gatewa
 		return nil
 	}
 
-	// recusa de ferramenta: o PRIMEIRO delta é inspecionado antes de ir ao
-	// cliente — recusa aborta a emissão com nada vazado, e a retratativa
-	// emenda na mesma conexão SSE. Também detecta "missed tool call" (modelo
-	// começa a narrar o conteúdo em vez de chamar a ferramenta de escrita)
-	// e "plain text call" (chamada emitida como JSON solto no texto, fora
-	// de code block — sem isso ela vaza como conteúdo E vira tool_calls,
-	// duplicada no cliente).
+	// recusa de ferramenta: o PRIMEIRO delta de conteúdo é inspecionado
+	// antes de ir ao cliente — recusa aborta a emissão com nada vazado, e a
+	// retratativa emenda na mesma conexão SSE. Também detecta "missed tool
+	// call" (modelo começa a narrar o conteúdo em vez de chamar a
+	// ferramenta de escrita) e "plain text call" (chamada emitida como JSON
+	// solto no texto, fora de code block — sem isso ela vaza como conteúdo
+	// E vira tool_calls, duplicada no cliente). Se uma chamada JÁ foi
+	// emitida precocemente, o modelo atendeu ao protocolo: as inspeções
+	// desistem (espelha o não-stream, onde calls>0 pula as retratativas).
 	declared := make(map[string]bool, len(req.Tools))
 	for _, t := range req.Tools {
 		declared[t.Function.Name] = true
 	}
+
+	// emissão de chamadas: um índice sequencial compartilhado entre a
+	// emissão PRECOCE (bloco fechou no meio da geração, via OnToolCall) e a
+	// tradução final — chamada já emitida não é re-enviada no fim (dedupe
+	// por conteúdo), e duplicatas exatas do mesmo turno são descartadas
+	// (bug clássico do Gemini web de re-emitir a mesma chamada).
+	callSeq := 0
+	seenCalls := map[string]bool{}
+	emitCall := func(c toolCall) {
+		key := c.Function.Name + "\x00" + c.Function.Arguments
+		if seenCalls[key] {
+			slog.Warn("chamada duplicada descartada (stream)", "tool", c.Function.Name)
+			return
+		}
+		seenCalls[key] = true
+		idx := callSeq
+		c.Index = &idx
+		callSeq++
+		chunk(chunkDelta{ToolCalls: []toolCall{c}}, nil)
+	}
+
 	firstDelta := true
 	checkRefusal := true
+	callsOut := 0 // chamadas emitidas precocemente nesta tentativa
 	onDelta := func(d string) error {
 		if firstDelta {
 			firstDelta = false
-			if checkRefusal && len(req.Tools) > 0 {
+			if checkRefusal && len(req.Tools) > 0 && callsOut == 0 {
 				if c, _ := scanRawToolCalls(d, declared); len(c) > 0 {
 					return errPlainTextCall
 				}
@@ -607,10 +634,25 @@ func streamChatCompletion(w http.ResponseWriter, ctx context.Context, gw *Gatewa
 		thePanel.addChars(rec, len(d))
 		return nil
 	}
+	hooks := StreamHooks{
+		OnStart: onStart,
+		OnDelta: onDelta,
+		Classify: func(code string) (toolCall, bool) {
+			return tryBuildToolCall(code, declared)
+		},
+		OnToolCall: func(c toolCall) error {
+			callsOut++
+			emitCall(c)
+			return nil
+		},
+	}
 	attempt := func(msgs []Message, check bool) (string, error) {
 		firstDelta = true
 		checkRefusal = check
-		return g.CompleteStream(ctx, msgs, req.Model, onStart, onDelta)
+		callsOut = 0
+		callSeq = 0
+		seenCalls = map[string]bool{} // tentativa abortada não deixa rastro
+		return g.CompleteStream(ctx, msgs, req.Model, hooks)
 	}
 
 	// Retratativa 1: recusa explícita de ferramenta
@@ -688,24 +730,24 @@ func streamChatCompletion(w http.ResponseWriter, ctx context.Context, gw *Gatewa
 
 	// chamadas de ferramenta: blocos retidos com forma de chamada mas nome
 	// não-declarado chegam como delta tardio de conteúdo; os declarados
-	// viram um chunk delta.tool_calls por chamada (índice explícito,
-	// argumentos completos — o cliente concatena por índice)
+	// viram chunks delta.tool_calls — os ainda não emitidos precocemente
+	// (emitCall deduplica por conteúdo e mantém a sequência de índices).
+	// Morph raro de part já emitida: prevalece a versão precoce (o cliente
+	// já a tem); a divergência segue para o log.
 	calls, _, late := parseToolCalls(finalText, declared)
 	if late != "" {
 		chunk(chunkDelta{Content: late}, nil)
 	}
-	if len(calls) > 0 {
-		slog.Info("tool calls parsed (stream)", "calls", len(calls))
-		for i := range calls {
-			idx := i
-			calls[i].Index = &idx
-			chunk(chunkDelta{ToolCalls: calls[i : i+1]}, nil)
-		}
+	for _, c := range calls {
+		emitCall(c)
+	}
+	if callSeq > 0 {
+		slog.Info("tool calls parsed (stream)", "calls", callSeq)
 		finish := "tool_calls"
 		chunk(chunkDelta{}, &finish)
 		thePanel.mutate(rec, func(r *reqRecord) {
 			r.Status = "tool_calls"
-			r.ToolCalls = len(calls)
+			r.ToolCalls = callSeq
 			r.FullPrompt = promptText
 			r.FullResponse = finalText
 		})

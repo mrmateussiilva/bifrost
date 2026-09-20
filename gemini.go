@@ -753,21 +753,18 @@ func modeByID(id string) *geminiMode {
 // de toda a operação — e, se morrer antes do fim (cliente desconectado),
 // aborta a espera. model seleciona o modo da UI.
 func (g *Gemini) Complete(ctx context.Context, messages []Message, model string) (string, error) {
-	return g.complete(ctx, messages, model, nil, nil)
+	return g.complete(ctx, messages, model, StreamHooks{})
 }
 
-// CompleteStream é o Complete com ganchos de streaming: onStart roda assim
-// que o envio do prompt está confirmado — o momento certo de escrever os
-// cabeçalhos SSE, porque erros anteriores (sessão, DOM, envio) ainda podem
-// virar status HTTP de verdade; onDelta recebe cada acréscimo de texto
-// enquanto a geração corre — e pode devolver erro para ABORTAR a emissão
-// (o handler usa isso para detectar recusa de ferramenta antes de qualquer
-// byte chegar ao cliente e retentar com correção).
-func (g *Gemini) CompleteStream(ctx context.Context, messages []Message, model string, onStart func() error, onDelta func(string) error) (string, error) {
-	return g.complete(ctx, messages, model, onStart, onDelta)
+// CompleteStream é o Complete com ganchos de streaming (StreamHooks): o
+// worker emite conteúdo via OnDelta, chamadas de ferramenta fechadas no
+// meio da geração via OnToolCall (classificadas por hooks.Classify) e
+// dispara OnStart assim que o envio do prompt está confirmado.
+func (g *Gemini) CompleteStream(ctx context.Context, messages []Message, model string, hooks StreamHooks) (string, error) {
+	return g.complete(ctx, messages, model, hooks)
 }
 
-func (g *Gemini) complete(ctx context.Context, messages []Message, model string, onStart func() error, onDelta func(string) error) (string, error) {
+func (g *Gemini) complete(ctx context.Context, messages []Message, model string, hooks StreamHooks) (string, error) {
 	mode := modeByID(model)
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -937,7 +934,7 @@ func (g *Gemini) complete(ctx context.Context, messages []Message, model string,
 	// vem depois de todas as navegações. Se falhar, streamResponse cai no
 	// caminho de polling (ch nil).
 	var streamCh chan streamChunk
-	if onDelta != nil {
+	if hooks.OnDelta != nil {
 		streamCh = make(chan streamChunk, 64)
 		g.setStreamCh(streamCh)
 		defer g.setStreamCh(nil)
@@ -973,16 +970,16 @@ func (g *Gemini) complete(ctx context.Context, messages []Message, model string,
 		g.lastProto = proto
 	}
 
-	if onStart != nil {
-		if err := onStart(); err != nil {
+	if hooks.OnStart != nil {
+		if err := hooks.OnStart(); err != nil {
 			return "", err
 		}
 	}
 
 	var text string
-	if onDelta != nil {
+	if hooks.OnDelta != nil {
 		slog.Info("generation started (stream)")
-		text, err = g.streamResponse(runCtx, before.Responses, streamCh, onDelta)
+		text, err = g.streamResponse(runCtx, before.Responses, streamCh, hooks)
 	} else {
 		slog.Info("generation started")
 		text, err = g.waitResponse(runCtx, before.Responses)
@@ -1230,7 +1227,17 @@ func (g *Gemini) listenChunks() {
 // antigo assume após a carência: emissão por parts ESTÁVEIS (part só sai
 // quando estável há 3 polls e já tem irmã — o Gemini continua escrevendo
 // um parágrafo depois de criar o elemento seguinte).
-func (g *Gemini) streamResponse(ctx context.Context, responsesBefore int, ch chan streamChunk, onDelta func(string) error) (string, error) {
+// streamResponse acompanha a geração e emete progressivamente: conteúdo
+// via observer (ou fallback por parts estáveis) e CHAMADAS DE FERRAMENTA
+// via hooks.OnToolCall assim que o bloco fecha e estabiliza no meio da
+// geração — o cliente pode começar a executar a primeira chamada enquanto
+// o resto da resposta ancora. Lookalikes (forma de chamada, nome não
+// declarado) continuam retidos: chegam como delta tardio no fim, porque
+// emitir conteúdo JSON mid-stream quebraria a invariante sentText ⊆
+// finalNoTool do emendo final. O texto completo (com fences de chamada)
+// segue sendo o retorno — a tradução final do handler é a fonte da verdade
+// e deduplica contra o que já foi emitido.
+func (g *Gemini) streamResponse(ctx context.Context, responsesBefore int, ch chan streamChunk, hooks StreamHooks) (string, error) {
 	const stableNeeded = 3
 	const observerGrace = 2500 * time.Millisecond
 
@@ -1238,10 +1245,12 @@ func (g *Gemini) streamResponse(ctx context.Context, responsesBefore int, ch cha
 	obsSeen := false
 	start := time.Now()
 
-	// fallback por parts estáveis (observer mudo)
+	// estabilidade por part — mantida SEMPRE (não só no fallback): a
+	// emissão precoce de chamadas depende dela mesmo com observer vivo
 	var prev []genPart
 	var stab []int
-	emitted := 0
+	emitted := 0 // fallback de texto: parts já emitidas como conteúdo
+	callPtr := 0 // emissão de chamadas: próxima part a examinar
 
 	lastFull := ""
 	stableFull := 0
@@ -1250,10 +1259,28 @@ func (g *Gemini) streamResponse(ctx context.Context, responsesBefore int, ch cha
 		if delta == "" {
 			return nil
 		}
-		if err := onDelta(delta); err != nil {
+		if err := hooks.OnDelta(delta); err != nil {
 			return fmt.Errorf("emissão abortada pelo callback: %w", err)
 		}
 		sentText += delta
+		return nil
+	}
+
+	// emitStableCall classifica um code block fechado com as tools
+	// declaradas (hooks.Classify) e o emite precocemente. Retorna erro só
+	// se o callback abortar; lookalike (não classificado) é no-op.
+	emitStableCall := func(code string) error {
+		if hooks.OnToolCall == nil || hooks.Classify == nil {
+			return nil
+		}
+		c, ok := hooks.Classify(code)
+		if !ok {
+			return nil
+		}
+		if err := hooks.OnToolCall(c); err != nil {
+			return fmt.Errorf("emissão de chamada abortada pelo callback: %w", err)
+		}
+		slog.Info("tool call emitida precocemente (bloco estável)", "tool", c.Function.Name)
 		return nil
 	}
 
@@ -1331,19 +1358,36 @@ func (g *Gemini) streamResponse(ctx context.Context, responsesBefore int, ch cha
 						}
 					}
 
+					// estabilidade por part: sempre atualizada (a emissão
+					// precoce de chamadas usa estes contadores)
+					cur := st.Parts
+					nextStab := make([]int, len(cur))
+					for i := range cur {
+						if i < len(prev) && prev[i] == cur[i] {
+							nextStab[i] = stab[i] + 1
+						}
+					}
+					prev, stab = cur, nextStab
+
+					// emissão precoce de chamadas: part com forma de chamada,
+					// estável há 3 polls E com irmã depois dela (o bloco
+					// fechou de verdade — a part viva nunca tem irmã
+					// confirmada). Avança em ordem de documento para as
+					// chamadas emitidas serem prefixo da tradução final;
+					// para no primeiro part não estável.
+					for callPtr < len(cur) && stab[callPtr] >= stableNeeded && callPtr+1 < len(cur) {
+						if p := cur[callPtr]; isToolCallPart(p) {
+							if err := emitStableCall(p.Code); err != nil {
+								return "", err
+							}
+						}
+						callPtr++
+					}
+
 					// fallback (observer mudo, após a carência): emissão por
 					// parts estáveis — part só sai estável há 3 polls E com
 					// irmã depois dela
 					if !obsSeen && time.Since(start) > observerGrace {
-						cur := st.Parts
-						nextStab := make([]int, len(cur))
-						for i := range cur {
-							if i < len(prev) && prev[i] == cur[i] {
-								nextStab[i] = stab[i] + 1
-							}
-						}
-						prev, stab = cur, nextStab
-
 						emitCount := 0
 						for i := 0; i+1 < len(cur) && stab[i] >= stableNeeded; i++ {
 							emitCount = i + 1

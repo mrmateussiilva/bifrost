@@ -45,6 +45,6 @@ func (c *ChatGPT) Complete(ctx context.Context, messages []Message, model string
 	return "", errors.New("chatgpt driver not implemented")
 }
 
-func (c *ChatGPT) CompleteStream(ctx context.Context, messages []Message, model string, onStart func() error, onDelta func(string) error) (string, error) {
+func (c *ChatGPT) CompleteStream(ctx context.Context, messages []Message, model string, hooks StreamHooks) (string, error) {
 	return "", errors.New("chatgpt driver not implemented")
 }

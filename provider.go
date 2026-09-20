@@ -25,13 +25,41 @@ type ProviderFactory interface {
 	DefaultModel() string
 }
 
+// StreamHooks são os ganchos de streaming do worker — o que o CompleteStream
+// invoca conforme a geração avança.
+//
+// OnStart roda assim que o envio do prompt está confirmado: o momento certo
+// de escrever cabeçalhos SSE, porque erros anteriores (sessão, DOM, envio)
+// ainda podem virar status HTTP de verdade.
+//
+// OnDelta recebe cada acréscimo de texto e pode devolver erro para ABORTAR
+// a geração (o handler usa isso para detectar recusa de ferramenta antes de
+// qualquer byte chegar ao cliente e retentar com correção).
+//
+// OnToolCall (opcional) recebe chamadas de ferramenta detectadas
+// PRECOCEMENTE: blocos de chamada que fecharam e estabilizaram no meio da
+// geração — o cliente pode começar a executar a primeira chamada enquanto o
+// resto da resposta ancora. Exige Classify. Pode devolver erro para abortar
+// (mesma semântica de OnDelta).
+//
+// Classify (opcional) decide se o conteúdo de um code block com forma de
+// chamada é uma ferramenta DECLARADA no request — fechamento sobre o mapa de
+// tools do lado do handler; sem ele o worker não emite chamadas precoces
+// (a tradução final continua valendo).
+type StreamHooks struct {
+	OnStart    func() error
+	OnDelta    func(string) error
+	OnToolCall func(toolCall) error
+	Classify   func(code string) (toolCall, bool)
+}
+
 // LLMWorker is the motor that runs inside a specific browser tab to execute generations.
 type LLMWorker interface {
 	// Complete sends a prompt and waits for the final response.
 	Complete(ctx context.Context, messages []Message, model string) (string, error)
 
 	// CompleteStream sends a prompt and streams the response via callbacks.
-	CompleteStream(ctx context.Context, messages []Message, model string, onStart func() error, onDelta func(string) error) (string, error)
+	CompleteStream(ctx context.Context, messages []Message, model string, hooks StreamHooks) (string, error)
 }
 
 // GetProvider returns the appropriate ProviderFactory based on the configured name.
