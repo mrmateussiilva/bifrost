@@ -242,6 +242,10 @@ var (
 	// serializado não cabe no orçamento — enviar wedgaria a página; o
 	// cliente precisa compactar o histórico (ou subir BIFROST_MAX_PROMPT).
 	ErrPromptTooLarge = errors.New("prompt excede o orçamento mesmo após elisão completa")
+	// errEditorResetPage: a aba foi trocada por página nova para destravar
+	// o editor preso com texto não enviado — o delta aderente perdeu o
+	// contexto; o chamador redigita o histórico completo.
+	errEditorResetPage = errors.New("página trocada para limpar o editor")
 )
 
 // maxStickyResponses: acima disso a conversa aderente reabre — conversas
@@ -1184,12 +1188,15 @@ func (g *Gemini) complete(ctx context.Context, messages []Message, model string,
 		}
 	}
 
-	// pré-envio (modo + observer + leitura de estado + digitação + envio)
+	// pré-envio (modo + limpeza de editor + observer + digitação + envio)
 	// como sequência RE-EXECUTÁVEL com teto próprio de 120s — essas etapas
 	// não podem consumir os 3 minutos do request. Página engasgada no meio
 	// (a digitação de prompt pesado é o ponto clássico: o probe leve de
 	// sessão PASSA, a interação pesada pendura): página NOVA via /app e
-	// recomeço limpo — editor vazio, estado relido.
+	// recomeço limpo — editor vazio, estado relido. O sentinela
+	// errEditorResetPage avisa que a página foi TROCADA dentro da sequência
+	// (editor preso) — o delta aderente perdeu o contexto e o histórico
+	// completo precisa ser redigitado pelo chamador.
 	preSubmit := func() (genState, chan streamChunk, bool, error) {
 		pctx, pcancel := context.WithTimeout(runCtx, 120*time.Second)
 		defer pcancel()
@@ -1198,6 +1205,37 @@ func (g *Gemini) complete(ctx context.Context, messages []Message, model string,
 		}
 		if err := g.ensureMode(pctx, mode); err != nil {
 			return fail(err)
+		}
+		// estado pré-observer: SOBRA de texto no editor = submit anterior
+		// falhou (ou alguém digitou na UI) — digitar em cima duplicaria o
+		// prompt (bug visto em produção: retry digitava delta em cima do
+		// delta não enviado). Reload ANTES da injeção do observer (a
+		// navegação destrói o contexto JS); texto não enviado NÃO sobrevive
+		// à navegação e a conversa (URL) preserva — o delta segue válido.
+		before, err := g.generationState(pctx)
+		if err != nil {
+			return fail(fmt.Errorf("ler estado da conversa: %w", err))
+		}
+		if strings.TrimSpace(before.EditorText) != "" {
+			slog.Warn("editor com texto não enviado; recarregando aba antes de digitar", "chars", len(before.EditorText))
+			cleared := false
+			if g.reloadTab() == nil {
+				if st, ok := g.waitConversationState(pctx, 12*time.Second); ok && strings.TrimSpace(st.EditorText) == "" {
+					before, cleared = st, true
+				}
+			}
+			if !cleared {
+				// editor preso nem com reload: página NOVA abandona a
+				// conversa — o chamador redigita o histórico COMPLETO e
+				// re-executa esta sequência (observer etc. inclusos)
+				if g.freshPage(runCtx) {
+					if _, ok := g.waitConversationState(pctx, 12*time.Second); ok {
+						return fail(errEditorResetPage)
+					}
+				}
+				return fail(fmt.Errorf("%w: editor ocupado com texto não enviado (%d chars); nem reload nem página nova limparam", ErrPromptNotFound, len(before.EditorText)))
+			}
+			slog.Info("editor limpo após reload; seguindo")
 		}
 		// observer: injetado ANTES de digitar e depois de TODA navegação
 		// (a navegação destrói o contexto JS da página); se falhar,
@@ -1212,10 +1250,6 @@ func (g *Gemini) complete(ctx context.Context, messages []Message, model string,
 				ch = nil
 			}
 		}
-		before, err := g.generationState(pctx)
-		if err != nil {
-			return fail(fmt.Errorf("ler estado da conversa: %w", err))
-		}
 		if err := g.typePrompt(pctx, prompt); err != nil {
 			return fail(err)
 		}
@@ -1227,25 +1261,45 @@ func (g *Gemini) complete(ctx context.Context, messages []Message, model string,
 	defer g.setStreamCh(nil) // limpa o último canal que a sequência instalar
 
 	before, streamCh, wedged, err := preSubmit()
-	if err != nil && wedged && runCtx.Err() == nil && g.ctx.Err() == nil {
-		slog.Warn("pré-envio pendurou (página engasgada); abrindo página nova e recomeçando", "err", err)
-		if g.freshPage(runCtx) {
-			// conversa NOVA: se o prompt era DELTA aderente, ele perdeu o
-			// contexto — redigita o histórico completo (orçado).
+	if err != nil && runCtx.Err() == nil && g.ctx.Err() == nil {
+		needFullPrompt := false
+		if wedged {
+			slog.Warn("pré-envio pendurou (página engasgada); abrindo página nova e recomeçando", "err", err)
+			if g.freshPage(runCtx) {
+				needFullPrompt = true
+			} else {
+				err = fmt.Errorf("%w: página nova não abriu", ErrPageUnresponsive)
+			}
+		} else if errors.Is(err, errEditorResetPage) {
+			// preSubmit trocou a página para destravar o editor preso — o
+			// delta aderente perdeu o contexto: histórico COMPLETO
+			slog.Warn("página trocada para limpar o editor; redigitando histórico completo")
+			needFullPrompt = true
+		}
+		if needFullPrompt {
 			// Determinístico: a 1ª serialização já passou pelo orçamento,
 			// esta não pode falhar.
 			prompt, _ = SerializeMessages(messages)
 			if b2, ch2, _, err2 := preSubmit(); err2 == nil {
 				before, streamCh, err = b2, ch2, nil
 			} else {
-				// nem página nova segurou a digitação: devolve o erro da
-				// tentativa (timeout 504) — browser segue na rotação, o
-				// problema é o volume, não o processo
+				// nem página nova segurou: devolve o erro da tentativa —
+				// browser segue na rotação (volume ≠ processo morto)
 				slog.Error("pré-envio falhou mesmo com página nova", "err", err2)
 				err = err2
 			}
-		} else {
-			err = fmt.Errorf("%w: página nova não abriu", ErrPageUnresponsive)
+		}
+	}
+	if err != nil && !wedged && runCtx.Err() == nil && g.ctx.Err() == nil {
+		// falha de DOM no pré-envio (texto não entra no editor / não
+		// envia): o editor ficou em estado ruim e o RETRY do cliente
+		// re-digitaria no mesmo editor quebrado — loop de 502 idênticos
+		// (visto em produção: 6+ retries de 1,6s falhando igual). Reload
+		// best-effort limpa o editor e destrava o renderer para a próxima
+		// tentativa.
+		if errors.Is(err, ErrPromptNotFound) || errors.Is(err, ErrResponseNotFound) {
+			slog.Warn("falha de DOM no pré-envio; recarregando aba para a próxima tentativa", "err", err)
+			_ = g.reloadTab()
 		}
 	}
 	if err != nil {
@@ -1343,13 +1397,27 @@ func (g *Gemini) probeUntilLoggedIn(runCtx context.Context, wait time.Duration) 
 	return false
 }
 
+// waitConversationState sonda o estado da conversa até a página responder
+// (pós-reload/navegação a página re-carrega; Evaluate antes disso falha)
+// ou o teto esgotar.
+func (g *Gemini) waitConversationState(ctx context.Context, wait time.Duration) (genState, bool) {
+	deadline := time.Now().Add(wait)
+	for time.Now().Before(deadline) && ctx.Err() == nil && g.ctx.Err() == nil {
+		if st, err := g.generationState(ctx); err == nil {
+			return st, true
+		}
+		time.Sleep(400 * time.Millisecond)
+	}
+	return genState{}, false
+}
+
 // freshPage navega a aba para /app (conversa NOVA, página leve) e reseta o
 // estado aderente. O reload NÃO cura conversa gigante: re-renderiza a
 // mesma conversa e a página volta a engasgar na primeira interação pesada
 // — a página nova abandona a conversa pesada de vez. O custo é o próximo
-// turno redigitar o histórico completo. Devolve false se nem a navegação
-// respondeu (processo do Chromium morto) ou a página nova não veio logada
-// no teto.
+// turno redigitar o histórico completo (orçado pelo serialize). Devolve
+// false se nem a navegação respondeu (processo do Chromium morto) ou a
+// página nova não veio logada no teto.
 func (g *Gemini) freshPage(runCtx context.Context) bool {
 	nctx, cancel := context.WithTimeout(g.ctx, 15*time.Second)
 	err := chromedp.Run(nctx, chromedp.Navigate(geminiSelectors.URL))
@@ -1415,7 +1483,10 @@ func (g *Gemini) typePrompt(ctx context.Context, prompt string) error {
 		return fmt.Errorf("%w: %v", ErrPromptNotFound, err)
 	}
 	// Poll: o Quill pode demorar alguns frames para refletir o texto no DOM.
-	deadline := time.Now().Add(1500 * time.Millisecond)
+	// 5s (era 1,5s): página com conversa de ~150KB renderiza devagar — o
+	// texto CHEGOU mas o DOM ainda não refletia, e o timeout cedo abortava
+	// a digitação que tinha funcionado (loop de 502 em produção).
+	deadline := time.Now().Add(5000 * time.Millisecond)
 	for time.Now().Before(deadline) {
 		st, err := g.generationState(ctx)
 		if err == nil && st.EditorText != "" {
@@ -1423,7 +1494,7 @@ func (g *Gemini) typePrompt(ctx context.Context, prompt string) error {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	return fmt.Errorf("%w: texto não apareceu no editor após 1,5s", ErrPromptNotFound)
+	return fmt.Errorf("%w: texto não apareceu no editor após 5s", ErrPromptNotFound)
 }
 
 // submit envia o que está no editor. Enter é o caminho primário (o Gemini
