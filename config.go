@@ -85,3 +85,18 @@ func envInt(key string, def int) int {
 	}
 	return i
 }
+
+// envNonNegative lê um int >= 0 do ambiente (ausente/inválido → default).
+// Diferente do envInt: 0 é valor VÁLIDO (desliga a funcionalidade) — usado
+// pelos orçamentos de prompt (BIFROST_TOOL_RESULT_MAX, BIFROST_MAX_PROMPT).
+func envNonNegative(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return def
+	}
+	return n
+}

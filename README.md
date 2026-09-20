@@ -110,6 +110,8 @@ All settings are environment variables:
 | `BIFROST_MODEL` | `gemini-web` | Default model when request omits `model` field |
 | `BIFROST_PASSWORD_STORE` | `gnome-libsecret` | Chrome cookie encryption: `gnome-libsecret` (desktop) or `basic` (container) |
 | `BIFROST_NO_SANDBOX` | `false` | Add `--no-sandbox` flags (required in Docker) |
+| `BIFROST_TOOL_RESULT_MAX` | `8192` | Max chars per tool result in the serialized prompt (fat bash/file outputs get head+marker+tail elision). `0` disables |
+| `BIFROST_MAX_PROMPT` | `150000` | Global prompt budget in chars. Over it, content is squeezed in stages — old tool results → old tool-call **arguments** (write/edit calls carry whole files) → old assistant/user text — and, as a last resort, the recent working set. System messages and the tool protocol are never elided. Still over after everything: `400 context_length_exceeded` instead of wedging the page. `0` disables |
 
 Example `docker-compose.yml` with auth:
 
@@ -226,12 +228,11 @@ Gemini Web has no native tool-calling protocol. Bifrost simulates it:
 - Success rate varies (~85-95% without retries; the auto-retry ladder recovers most failures) — the model sometimes ignores tool instructions
 - Token counts are estimated, not exact
 
-**Wedge protection (renderer recovery):** very long agent sessions can wedge the Gemini page's renderer for minutes — every CDP evaluate queues behind it, and before the fix even `/health` and the panel hung together (they probed the page without a deadline). Recovery ladder:
+**Prompt budget (wedge protection):** very long agent sessions (100+ messages, 28 tools) produce prompts that wedge the Gemini page's renderer for minutes — every CDP evaluate queues behind it, and before the fix even `/health` and the panel hung together (they probed the page without a deadline). One such session reached **244 KB** (tool-call fences carrying whole files in their arguments + agent system prompt + 28-tool protocol). Protection layers:
 
-1. **Probe ceilings everywhere**: `/health` and `/panel/data` probe with a 5s cap (a wedged page reports the shard as down instead of hanging the endpoint); the session check carries a 30s cap; the pre-submit sequence (mode switch, typing, submit) has its own 120s ceiling instead of eating the request's 3-minute deadline.
-2. **Tab reload** (Page.reload is a browser-level command — it doesn't need the page's stuck main thread, so it replaces the hung renderer; the conversation URL is preserved).
-3. **Fresh page via /app** when reloading isn't enough — reloading merely re-renders the giant conversation and it re-wedges; a fresh page abandons it and the next turn retypes the history.
-4. **Browser relaunch** when even navigation doesn't respond (the Chrome process itself is dead): the shard is marked suspect and the next acquire restarts the browser, recreating the workers from the persisted profile session.
+1. **Always-on caps**: per tool result (`BIFROST_TOOL_RESULT_MAX`, 8192), per user/assistant message (12 KB — giant user pastes), per tool-call arguments (4 KB — `write`/`edit` calls carry whole files; over the cap the arguments become a valid-JSON marker). All deterministic — the same resent history elides identically, so sticky prefix matching between turns is preserved. System messages and the tool protocol are never elided (agent identity).
+2. **Global budget** (`BIFROST_MAX_PROMPT`, default 150000 chars): over it, content is squeezed in stages — old tool results → old tool-call arguments → old assistant/user text (head-only, oldest first, last 6 messages spared) — and, as a last resort, the recent working set is degraded too (worse recent context beats an error). Still over after everything: **`400 context_length_exceeded`** — an honest error the client can act on, instead of typing 244 KB and wedging the page.
+3. **Escalating unwedge ladder**: state probes carry short ceilings (30s pre-submit, 5s for health/panel — a wedged page fails fast instead of eating the request's 3-minute deadline, and `/health`/`/panel/data` report the shard as down instead of hanging). A wedged page is recovered in escalating steps: **tab reload** (browser-level command, replaces the hung renderer, preserves the conversation) → **fresh page via /app** (abandons the giant conversation — reloading merely re-rendends it and it re-wedges; the next turn retypes the bounded history) → **browser relaunch** (when even navigation doesn't respond, the Chrome process itself is dead; the shard is marked and the next acquire restarts it, recreating workers from the persisted profile session). If typing wedges *mid-prompt*, the sequence restarts cleanly on a fresh page with the full bounded history.
 
 ---
 

@@ -375,7 +375,14 @@ func handleChat(gw *Gateway) http.HandlerFunc {
 			msgs = req.Messages
 		}
 
-		promptText := SerializeMessages(msgs)
+		promptText, serr := SerializeMessages(msgs)
+		if serr != nil {
+			// prompt não cabe nem com elisão completa: 400 na hora, sem
+			// tocar o browser — digitar 244KB wedga a página (incidente
+			// 2026-09-20); erro honesto que o cliente pode tratar
+			writeAPIError(w, http.StatusBadRequest, errInvalidRequest, "context_length_exceeded", serr.Error())
+			return
+		}
 		slog.Info("request received", "messages", len(msgs), "model", req.Model, "stream", req.Stream, "tools", len(req.Tools))
 
 		// rastro para o painel: começa quando o request ganhou a vez
@@ -514,6 +521,9 @@ func completionErrorInfo(err error) (status int, errType, code, msg string) {
 		// renderer engasgado (conversa/prompt gigante): 503 — o cliente
 		// pode retentar; o reload da aba já foi tentado dentro do complete
 		return http.StatusServiceUnavailable, errAPIError, "gemini_page_unresponsive", err.Error()
+	case errors.Is(err, ErrPromptTooLarge):
+		// espelha o contexto excedido do OpenAI: o cliente sabe compactar
+		return http.StatusBadRequest, errInvalidRequest, "context_length_exceeded", err.Error()
 	case errors.Is(err, ErrBrowserClosed):
 		return http.StatusServiceUnavailable, errAPIError, "browser_closed", err.Error()
 	case errors.Is(err, ErrGenerationTimeout):

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/chromedp/cdproto/input"
 	"github.com/chromedp/cdproto/runtime"
@@ -236,6 +237,11 @@ var (
 	// ErrPageUnresponsive: o renderer da página engasgou (conversa/prompt
 	// gigante) e nem o reload destravou — o Evaluate não volta.
 	ErrPageUnresponsive = errors.New("gemini page unresponsive (renderer wedged)")
+	// ErrPromptTooLarge: mesmo após TODA a elisão (resultados, argumentos
+	// de chamadas, texto antigo, último recurso no working set) o prompt
+	// serializado não cabe no orçamento — enviar wedgaria a página; o
+	// cliente precisa compactar o histórico (ou subir BIFROST_MAX_PROMPT).
+	ErrPromptTooLarge = errors.New("prompt excede o orçamento mesmo após elisão completa")
 )
 
 // maxStickyResponses: acima disso a conversa aderente reabre — conversas
@@ -396,11 +402,214 @@ func elideTextAssistants(msgs []Message) []Message {
 	return out
 }
 
+// toolResultMax: teto por resultado de tool no prompt serializado
+// (BIFROST_TOOL_RESULT_MAX, chars; 0 desliga). Resultados gordos — output
+// de bash, leitura de arquivo — são os que fazem a digitação do prompt
+// destravar a página do Gemini (incidente 2026-09-20: sessão opencode com
+// 68 mensagens pendurava o renderer por minutos). Elisão DETERMINÍSTICA
+// (função pura do conteúdo): o mesmo histórico reenviado elide igual, e o
+// casamento de prefixo da conversa aderente entre turnos não quebra.
+var toolResultMax = envNonNegative("BIFROST_TOOL_RESULT_MAX", 8192)
+
+// promptMax: orçamento global do prompt serializado (BIFROST_MAX_PROMPT,
+// chars; 0 desliga). Incidente 2026-09-20 v3: prompt de 244KB (sessão
+// opencode com 141 mensagens — fences de tool_call carregando arquivos
+// inteiros nos argumentos + protocolo de 28 tools + system do opencode)
+// wedgava a página instantaneamente e o aperto antigo não alcançava os
+// fences. Agora a elisão alcança TUDO que é conversa (resultados,
+// argumentos de chamada, texto antigo, working set em último recurso) —
+// e o que não couber nem assim vira erro 400 context_length_exceeded em
+// vez de digitar e wedgar. System/Control/Nudge nunca são elididos
+// (identidade do agente + protocolo). 150KB: cabe o esqueleto do opencode
+// (system ~45KB + protocolo ~60KB) + working set orçado.
+var promptMax = envNonNegative("BIFROST_MAX_PROMPT", 150000)
+
+// msgContentMax: teto SEMPRE ATIVO por mensagem de user/assistant (texto)
+// — paste gigante do usuário no meio da sessão não pode chegar inteiro
+// na digitação. Cabeça+marcador+cauda, determinístico.
+const msgContentMax = 12288
+
+// toolCallArgsMax: teto SEMPRE ATIVO por argumentos de tool_call
+// serializado — chamadas write/edit carregam arquivos inteiros; acima
+// disto os argumentos viram um marcador JSON (o fence segue válido, o
+// mapa id→nome não depende dos argumentos).
+const toolCallArgsMax = 4096
+
+// elideToolResult trunca um conteúdo gordo em cabeça + marcador + cauda,
+// cortando em fronteira de rune (o texto vai por CDP: UTF-8 quebrado no
+// meio de runa não pode). Total ficado fica abaixo de max.
+func elideToolResult(content string, max int) string {
+	if max <= 0 || len(content) <= max {
+		return content
+	}
+	head := max * 2 / 3
+	tail := max / 6
+	if head > len(content) {
+		head = len(content)
+	}
+	for head > 0 && !utf8.RuneStart(content[head]) {
+		head--
+	}
+	tailStart := len(content) - tail
+	if tailStart <= head {
+		tailStart = len(content) // sem espaço para cauda
+	}
+	for tailStart < len(content) && !utf8.RuneStart(content[tailStart]) {
+		tailStart++
+	}
+	omitted := tailStart - head
+	return content[:head] +
+		fmt.Sprintf("\n\n[… bifrost: %d caracteres omitidos …]\n\n", omitted) +
+		content[tailStart:]
+}
+
 // SerializeMessages transforma o histórico OpenAI em um prompt textual — a
 // UI web do Gemini não aceita histórico estruturado. Chamadas de ferramenta
-// do assistente viram fences tool_call (o formato que o próprio modelo foi
-// instruído a emitir) e resultados chegam como mensagens [TOOL nome].
-func SerializeMessages(messages []Message) string {
+// do assistente viram fences e resultados chegam como mensagens [TOOL nome].
+// Orçamentos em três níveis (tudo DETERMINÍSTICO — função pura do conteúdo,
+// o mesmo histórico reenviado elide igual e o casamento de prefixo do
+// sticky não quebra):
+//   - sempre ativo: por-resultado (toolResultMax), por-mensagem de texto
+//     (msgContentMax), por-argumentos de chamada (toolCallArgsMax)
+//   - orçamento global: aperta o conteúdo ANTIGO (resultados → argumentos
+//     de chamada → texto assistant → texto user, só-cabeça de 512)
+//   - último recurso: degrada o working set (últimas mensagens) — melhor
+//     contexto recente pior do que erro
+//     System/Control/Nudge NUNCA são elididos (identidade do agente).
+//     Ainda acima do orçamento → ErrPromptTooLarge (400 no cliente) —
+//     digitar 244KB wedga a página; erro honesto é melhor.
+func SerializeMessages(messages []Message) (string, error) {
+	return serializeMessagesCap(messages, toolResultMax, promptMax)
+}
+
+// elideArgsMarker substitui argumentos gordos de tool_call por um
+// marcador JSON válido (o fence segue parseável; o mapa id→nome do
+// histórico usa só o nome da função).
+func elideArgsMarker(args string) string {
+	return fmt.Sprintf(`{"bifrost_args_omitidos": %d}`, len(args))
+}
+
+// serializeMessagesCap é o SerializeMessages com orçamentos explícitos
+// (injetáveis em teste).
+func serializeMessagesCap(messages []Message, perResult, globalMax int) (string, error) {
+	b := serializeRaw(messages, perResult)
+	if globalMax <= 0 || len(b) <= globalMax {
+		return b, nil
+	}
+	const squeezeHead = 512
+	const keepRecent = 6
+	squeezed := make([]Message, len(messages))
+	copy(squeezed, messages)
+	old := func(i int) bool { return i < len(squeezed)-keepRecent }
+	fit := func() (string, bool) {
+		nb := serializeRaw(squeezed, perResult)
+		return nb, len(nb) <= globalMax
+	}
+	done := func(stage string) (string, bool) {
+		if nb, ok := fit(); ok {
+			slog.Warn("prompt: orçamento global estourado; conteúdo apertado",
+				"stage", stage, "prompt_chars", len(b), "capped_chars", len(nb), "max", globalMax)
+			return nb, true
+		}
+		return "", false
+	}
+
+	// passe 1: resultados de tool antigos → só-cabeça
+	for i := range squeezed {
+		m := &squeezed[i]
+		if m.Role != "tool" || m.Control || m.Nudge || !old(i) || len(m.Content) <= squeezeHead {
+			continue
+		}
+		m.Content = elideToolResult(m.Content, squeezeHead)
+		if nb, ok := done("tool-antigo"); ok {
+			return nb, nil
+		}
+	}
+
+	// passe 2: argumentos de tool_call antigos → marcador. É O BURACO DO
+	// incidente 244KB: ~70 fences de write/edit carregando arquivos
+	// inteiros — assistant com tool_calls era pulado no aperto.
+	for i := range squeezed {
+		m := &squeezed[i]
+		if m.Role != "assistant" || m.Control || m.Nudge || !old(i) || len(m.ToolCalls) == 0 {
+			continue
+		}
+		changed := false
+		tcs := make([]toolCall, len(m.ToolCalls))
+		copy(tcs, m.ToolCalls) // cópia profunda: o slice original é compartilhado
+		for j := range tcs {
+			if len(tcs[j].Function.Arguments) > squeezeHead {
+				tcs[j].Function.Arguments = elideArgsMarker(tcs[j].Function.Arguments)
+				changed = true
+			}
+		}
+		if changed {
+			m.ToolCalls = tcs
+			if nb, ok := done("args-antigos"); ok {
+				return nb, nil
+			}
+		}
+	}
+
+	// passes 3/4: texto antigo de assistant (sem chamadas) e user → só-cabeça
+	for _, role := range []string{"assistant", "user"} {
+		for i := range squeezed {
+			m := &squeezed[i]
+			if m.Role != role || m.Control || m.Nudge || !old(i) || len(m.ToolCalls) > 0 || len(m.Content) <= squeezeHead {
+				continue
+			}
+			m.Content = elideToolResult(m.Content, squeezeHead)
+			if nb, ok := done("texto-antigo"); ok {
+				return nb, nil
+			}
+		}
+	}
+
+	// último recurso: working set degradado — as mensagens RECENTES (mais
+	// antiga primeiro) também viram só-cabeça, e os argumentos de chamadas
+	// recentes viram marcador. Contexto recente pior > erro para o cliente.
+	for i := len(squeezed) - keepRecent; i < len(squeezed); i++ {
+		if i < 0 {
+			continue
+		}
+		m := &squeezed[i]
+		if m.Control || m.Nudge || m.Role == "system" {
+			continue // identidade do agente: nunca, nem em último recurso
+		}
+		if len(m.Content) > squeezeHead {
+			m.Content = elideToolResult(m.Content, squeezeHead)
+			if nb, ok := done("working-set"); ok {
+				return nb, nil
+			}
+		}
+		if len(m.ToolCalls) > 0 {
+			tcs := make([]toolCall, len(m.ToolCalls))
+			copy(tcs, m.ToolCalls)
+			changed := false
+			for j := range tcs {
+				if len(tcs[j].Function.Arguments) > squeezeHead {
+					tcs[j].Function.Arguments = elideArgsMarker(tcs[j].Function.Arguments)
+					changed = true
+				}
+			}
+			if changed {
+				m.ToolCalls = tcs
+				if nb, ok := done("working-set-args"); ok {
+					return nb, nil
+				}
+			}
+		}
+	}
+
+	return "", fmt.Errorf("%w: %d chars após elisão completa (orçamento %d) — system/protocolo maiores que o orçamento; compacte o histórico ou suba BIFROST_MAX_PROMPT",
+		ErrPromptTooLarge, len(b), globalMax)
+}
+
+// serializeRaw serializa sem o orçamento global, aplicando os tetos
+// sempre-ativos: por-resultado (tool), por-mensagem (texto de
+// user/assistant), por-argumentos de chamada. System/Control/Nudge vão
+// INTEIROS — são a identidade do agente e o protocolo de tools.
+func serializeRaw(messages []Message, perResult int) string {
 	var b strings.Builder
 	toolNames := map[string]string{} // tool_call_id → nome da função
 	for _, m := range messages {
@@ -410,19 +619,33 @@ func SerializeMessages(messages []Message) string {
 			if name := toolNames[m.ToolCallID]; name != "" {
 				label = "TOOL " + name
 			}
-			fmt.Fprintf(&b, "[%s]\n%s\n\n", label, m.Content)
+			content := m.Content
+			if elided := elideToolResult(content, perResult); len(elided) < len(content) {
+				slog.Debug("prompt: resultado de tool elidado", "tool", label, "orig", len(content), "kept", len(elided))
+				content = elided
+			}
+			fmt.Fprintf(&b, "[%s]\n%s\n\n", label, content)
 		case m.Content == "" && len(m.ToolCalls) == 0:
 			// mensagem vazia: nada a serializar
 		default:
 			fmt.Fprintf(&b, "[%s]\n", strings.ToUpper(m.Role))
 			if m.Content != "" {
-				fmt.Fprintf(&b, "%s\n", m.Content)
+				content := m.Content
+				if m.Role != "system" && !m.Control && !m.Nudge {
+					if elided := elideToolResult(content, msgContentMax); len(elided) < len(content) {
+						content = elided
+					}
+				}
+				fmt.Fprintf(&b, "%s\n", content)
 			}
 			for _, tc := range m.ToolCalls {
 				toolNames[tc.ID] = tc.Function.Name
 				args := tc.Function.Arguments
 				if !json.Valid([]byte(args)) {
 					args = "{}"
+				}
+				if len(args) > toolCallArgsMax {
+					args = elideArgsMarker(args)
 				}
 				fmt.Fprintf(&b, "%stool_call\n{\"name\": %q, \"arguments\": %s}\n%s\n", fence, tc.Function.Name, args, fence)
 			}
@@ -925,7 +1148,11 @@ func (g *Gemini) complete(ctx context.Context, messages []Message, model string,
 			}
 			send = append(send, m)
 		}
-		if p := SerializeMessages(send); strings.TrimSpace(p) != "" {
+		p, serr := SerializeMessages(send)
+		if serr != nil {
+			return "", serr
+		}
+		if strings.TrimSpace(p) != "" {
 			prompt = p
 			slog.Info("conversa aderente: reutilizando conversa",
 				"delta_msgs", len(send), "chars", len(prompt), "base_msgs", len(base), "proto_compact", compactProto)
@@ -950,7 +1177,11 @@ func (g *Gemini) complete(ctx context.Context, messages []Message, model string,
 				slog.Info("fresh conversation")
 			}
 		}
-		prompt = SerializeMessages(messages)
+		var serr error
+		prompt, serr = SerializeMessages(messages)
+		if serr != nil {
+			return "", serr
+		}
 	}
 
 	// pré-envio (modo + observer + leitura de estado + digitação + envio)
@@ -1000,8 +1231,10 @@ func (g *Gemini) complete(ctx context.Context, messages []Message, model string,
 		slog.Warn("pré-envio pendurou (página engasgada); abrindo página nova e recomeçando", "err", err)
 		if g.freshPage(runCtx) {
 			// conversa NOVA: se o prompt era DELTA aderente, ele perdeu o
-			// contexto — redigita o histórico completo
-			prompt = SerializeMessages(messages)
+			// contexto — redigita o histórico completo (orçado).
+			// Determinístico: a 1ª serialização já passou pelo orçamento,
+			// esta não pode falhar.
+			prompt, _ = SerializeMessages(messages)
 			if b2, ch2, _, err2 := preSubmit(); err2 == nil {
 				before, streamCh, err = b2, ch2, nil
 			} else {
