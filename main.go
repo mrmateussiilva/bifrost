@@ -10,7 +10,9 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -117,11 +119,21 @@ func run(ctx context.Context, cfg Config, args []string) error {
 	}
 }
 
-// runLogin abre o Gemini e espera existir sessão. Na primeira execução o
-// login é manual, na janela do Chromium; nada é automatizado. Detectada a
-// sessão, o processo segue vivo até Ctrl+C ou a janela fechar — assim o
-// Chromium encerra com graça e grava os cookies no profile.
+// runLogin abre o Chromium e espera existir sessão. Na primeira execução o
+// login é manual, na janela; nada é automatizado. Detectada a sessão, o
+// processo segue vivo até Ctrl+C ou a janela fechar — assim o Chromium
+// encerra com graça e grava os cookies no profile.
+//
+// Gemini: janela com CDP anexado (o poll de sessão funciona; o login do
+// Google passa). ChatGPT: Chrome EXTERNO, sem CDP — o Cloudflare Turnstile
+// do chatgpt.com falha em Chrome com porta de debugging anexada (mesmo
+// headed e sem --enable-automation: o desafio "verificar humano" dá erro
+// na hora do clique). O login acontece num Chrome limpo e o bifrost só
+// REUSA o profile depois.
 func runLogin(ctx context.Context, cfg Config) error {
+	if cfg.Provider == "chatgpt" {
+		return runLoginExternal(ctx, cfg)
+	}
 	if cfg.Headless {
 		slog.Warn("login manual exige janela visível; ignorando headless")
 		cfg.Headless = false
@@ -132,7 +144,7 @@ func runLogin(ctx context.Context, cfg Config) error {
 	}
 	defer browser.Close()
 
-	if err := OpenGemini(browser.BootCtx); err != nil {
+	if err := GetProvider(cfg.Provider).Open(browser.BootCtx); err != nil {
 		return err
 	}
 
@@ -148,7 +160,7 @@ func runLogin(ctx context.Context, cfg Config) error {
 		case <-browser.BootCtx.Done():
 			return fmt.Errorf("chromium fechou antes da sessão ser confirmada")
 		case <-ticker.C:
-			state, url, err := GeminiState(browser.BootCtx)
+			state, url, err := GetProvider(cfg.Provider).State(browser.BootCtx)
 			if err != nil {
 				continue // navegação em andamento; tenta de novo no próximo tick
 			}
@@ -175,10 +187,90 @@ func runLogin(ctx context.Context, cfg Config) error {
 	}
 }
 
+// runLoginExternal abre um Chrome LIMPO (sem CDP, sem porta de debugging)
+// com o profile do provedor e espera o usuário fechar a janela depois do
+// login — o único caminho que passa no Cloudflare Turnstile do chatgpt.com.
+// Depois o bifrost sobe o browser normal e CONFIRMA a sessão do profile.
+func runLoginExternal(ctx context.Context, cfg Config) error {
+	chrome := cfg.ChromePath
+	if chrome == "" {
+		var lerr error
+		for _, cand := range []string{"google-chrome-stable", "google-chrome", "chromium", "chromium-browser"} {
+			if chrome, lerr = exec.LookPath(cand); lerr == nil {
+				break
+			}
+		}
+		if chrome == "" {
+			return errors.New("Chrome/Chromium não achado no PATH; defina BIFROST_CHROME")
+		}
+	}
+	profile, err := filepath.Abs(cfg.Profile)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(profile), 0o755); err != nil {
+		return err
+	}
+
+	fmt.Println("==> Login EXTERNO (Chrome sem automação). O Cloudflare do chatgpt.com")
+	fmt.Println("    rejeita Chrome com CDP anexado — o desafio 'verificar humano' falha.")
+	fmt.Println("    Vai abrir uma janela NORMAL do Chrome:")
+	fmt.Println("    1. faça o login (conta Google/e-mail) e o desafio lá dentro")
+	fmt.Println("    2. confirme que o chat carregou logado")
+	fmt.Println("    3. FECHE a janela do Chrome para o bifrost continuar")
+	fmt.Printf("==> profile: %s\n", profile)
+
+	cmd := exec.CommandContext(ctx, chrome,
+		"--user-data-dir="+profile,
+		"--no-first-run",
+		"--no-default-browser-check",
+		chatgptSelectors.URL,
+	)
+	if err := cmd.Run(); err != nil {
+		slog.Warn("chrome externo encerrou", "err", err)
+	}
+
+	// verificação: o bifrost sobe o browser normal (CDP) e confere que a
+	// sessão gravou no profile — mesma checagem do gateway em produção
+	browser, err := StartBrowser(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer browser.Close()
+	factory := GetProvider(cfg.Provider)
+	if err := factory.Open(browser.BootCtx); err != nil {
+		// redirect (auth/challenge) aborta a navegação original sem a
+		// página estar quebrada — segue sondando o que aterrissou
+		slog.Warn("navegação pós-login reportou erro; sondando a página atual", "err", err)
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-browser.BootCtx.Done():
+			return fmt.Errorf("chromium fechou antes da sessão ser confirmada")
+		default:
+		}
+		state, _, serr := factory.State(browser.BootCtx)
+		if serr == nil {
+			if state == stateLoggedIn {
+				fmt.Println("==> sessão confirmada no profile — pronto para `bifrost test`")
+				return nil
+			}
+		}
+		time.Sleep(time.Second)
+	}
+	return errors.New("sessão não confirmada após o login externo; rode `bifrost inspect` para diagnóstico")
+}
+
 // runInspect abre o Gemini e despeja o DOM em JSON para confirmar seletores.
 // Exige sessão logada: sem login o chat — e os elementos que interessam —
 // não existem na página.
 func runInspect(ctx context.Context, cfg Config) error {
+	if cfg.Provider == "chatgpt" {
+		return runInspectChatGPT(ctx, cfg)
+	}
 	browser, err := StartBrowser(ctx, cfg)
 	if err != nil {
 		return err
@@ -229,6 +321,36 @@ func runInspect(ctx context.Context, cfg Config) error {
 	} else {
 		slog.Info("screenshot salvo", "path", "data/inspect.png")
 	}
+	return nil
+}
+
+// runInspectChatGPT despeja o DOM do chatgpt.com — a ferramenta de
+// CALIBRAÇÃO dos seletores provisórios: revela se a tela é o app logado,
+// a página de login ou o desafio Cloudflare, e o inventário de
+// data-testid para escolher os seletores certos. Não exige sessão: o dump
+// da página deslogada também orienta.
+func runInspectChatGPT(ctx context.Context, cfg Config) error {
+	browser, err := StartBrowser(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer browser.Close()
+
+	factory := GetProvider(cfg.Provider)
+	if err := factory.Open(browser.BootCtx); err != nil {
+		slog.Warn("navegação falhou; despejando o DOM do que estiver na tela", "err", err)
+	}
+	// deixa a UI assentar (redirects do auth/challenge)
+	time.Sleep(3 * time.Second)
+
+	state, url, _ := factory.State(browser.BootCtx)
+	slog.Info("page state", "state", state.String(), "url", url)
+
+	dump, derr := InspectChatGPT(browser.BootCtx)
+	if derr != nil {
+		return derr
+	}
+	fmt.Println(dump)
 	return nil
 }
 

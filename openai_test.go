@@ -476,3 +476,32 @@ func TestModelObjects(t *testing.T) {
 		t.Errorf("modelObjectFor('invalid-model-name') returned true; want false")
 	}
 }
+
+func TestGetProviderRoutes(t *testing.T) {
+	if got := GetProvider("chatgpt").Name(); got != "chatgpt" {
+		t.Errorf("GetProvider(chatgpt).Name() = %q; want chatgpt", got)
+	}
+	if got := GetProvider("gemini").Name(); got != "gemini" {
+		t.Errorf("GetProvider(gemini).Name() = %q; want gemini", got)
+	}
+	if got := GetProvider("qualquer-coisa").Name(); got != "gemini" {
+		t.Errorf("default deveria ser gemini, veio %q", got)
+	}
+	// o driver do chatgpt satisfaz o contrato do motor
+	var _ WebProvider = &ChatGPT{ctx: nil}
+	var _ WebProvider = &Gemini{ctx: nil}
+	// modelos expostos incluem o default
+	f := GetProvider("chatgpt")
+	if f.DefaultModel() != "chatgpt-web" {
+		t.Errorf("DefaultModel = %q; want chatgpt-web", f.DefaultModel())
+	}
+	found := false
+	for _, m := range f.Models() {
+		if m.ID == "chatgpt-web" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("chatgpt-web ausente em Models()")
+	}
+}

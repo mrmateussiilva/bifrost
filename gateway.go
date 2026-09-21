@@ -508,6 +508,19 @@ func (gw *Gateway) TriggerLogin(idx int) bool {
 	if idx < 0 || idx >= len(gw.shards) {
 		return false
 	}
+	// ChatGPT: o login pelo painel abre Chrome com CDP anexado — o
+	// Cloudflare Turnstile do chatgpt.com REJEITA (desafio falha no clique).
+	// O caminho que passa é o login EXTERNO do `bifrost login` (Chrome
+	// limpo, sem automação); orienta em vez de abrir a janela que falharia.
+	if gw.factory.Name() == "chatgpt" {
+		gw.setLoginStatus(LoginStatus{
+			Done:    true,
+			Ok:      false,
+			Profile: gw.shards[idx].name,
+			Message: "ChatGPT: use `bifrost login` no host — o Cloudflare rejeita o login em Chrome automatizado (janela externa, sem CDP)",
+		})
+		return true
+	}
 	if !gw.loginActive.CompareAndSwap(false, true) {
 		return false // já em andamento
 	}

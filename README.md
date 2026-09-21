@@ -99,7 +99,7 @@ All settings are environment variables:
 | Variable | Default | Description |
 |---|---|---|
 | `BIFROST_ADDR` | `:8080` | HTTP listen address |
-| `BIFROST_PROVIDER` | `gemini` | LLM provider: `gemini` or `chatgpt` (experimental) |
+| `BIFROST_PROVIDER` | `gemini` | LLM provider: `gemini` or `chatgpt` (see [ChatGPT provider](#chatgpt-provider)) |
 | `BIFROST_PROFILES` | *(none)* | Multi-profile: comma-separated Chrome profiles — one browser per account, round-robin (see below) |
 | `BIFROST_POOL_SIZE` | `1` | Tabs per profile (with sticky conversations, 1 is recommended — affinity is per profile) |
 | `BIFROST_PROFILE` | `./data/chrome-profile` | Chromium user data dir (persists login) |
@@ -342,7 +342,7 @@ bifrost serve     # Start the HTTP API server (default when no command given)
 - **Observer-driven streaming** — a `MutationObserver` pushes response text through the CDP console channel (~100ms throttle); a 300ms DOM poll remains as completion detector and fallback
 - **CDP over Puppeteer/Playwright** — pure Go, no Node.js dependency, smaller Docker image
 - **Profile persistence** — Chrome saves the Google session to disk; no re-login on restart
-- **Provider abstraction** — `ProviderFactory`/`LLMWorker` interfaces; ChatGPT web is an experimental second provider (`BIFROST_PROVIDER=chatgpt`)
+- **Provider abstraction** — `ProviderFactory`/`LLMWorker` interfaces over a shared **WebWorker engine** (webworker.go): the whole request cycle (session probes + unwedge ladder, sticky conversations, editor recovery, typing, submit, streaming, prompt budget) is provider-agnostic; drivers only implement the DOM layer (`WebProvider` interface). ChatGPT web is a full driver on this engine (`BIFROST_PROVIDER=chatgpt`, provisional selectors — see below)
 - **Structured DOM extraction** — the response is extracted as typed parts (text, code, tables, nested lists), not raw `innerText`: code blocks keep language label + pure code, tables become markdown pipes, nested lists keep indentation, inline `code`/`bold`/`italic` keep their markers — all via a recursive walk that pierces the UI's wrapper divs
 
 ---
@@ -407,6 +407,28 @@ Ensure your agent is sending tool definitions in the `tools` field of the reques
 
 ---
 
+## ChatGPT Provider
+
+`BIFROST_PROVIDER=chatgpt` runs the gateway on **chatgpt.com** over the same `WebWorker` engine as Gemini: sticky conversations, streaming, function calling, prompt budget, wedge/editor recovery — all inherited. The driver (`chatgpt.go`) only implements the DOM layer (`WebProvider`): state JS, parts extraction, observer, model dropdown, new chat.
+
+**Current state: full driver, provisional selectors** — mapped against the known chatgpt.com DOM, not yet validated against a logged-in page. Setup:
+
+1. `BIFROST_PROVIDER=chatgpt BIFROST_PROFILE=./data/chatgpt-profile bifrost login` — runs the **external login**: a clean Chrome window (no CDP, no automation) opens; log in manually and solve the Cloudflare challenge there, then close the window. Bifrost then verifies the session landed in the profile. Why external: **the Cloudflare Turnstile on chatgpt.com fails in any CDP-attached Chrome** (even headed, even without `--enable-automation`) — the "verify you are human" click errors out. The panel's login button knows this and points here.
+2. `bifrost test "olá"` — validates the whole chain (state → typing → submit → extraction); failures print the DOM dump path for calibration
+3. Adjust `chatgptSelectors` / `chatgptPartsFn` in `chatgpt.go` against the real DOM
+
+**Provisional pieces** (each has a TODO-grade simplification until calibrated):
+
+- Code-block language labels not extracted (`lang=""`) — tool-call detection is content-based (labels don't survive the DOM anyway, same rule as Gemini), so function calling works regardless
+- Tables serialize as plain `innerText` (no markdown pipes yet)
+- UI generation-error banner not detected (`generationError` always false)
+- Model menu labels (`GPT-4o`, `4o mini`) are guesses — `chatgpt-web` (default) never touches the dropdown, and a failed switch **degrades with a warning** instead of failing the request
+- `bifrost modes` / `bifrost probe-menu` remain Gemini-only
+
+**Known external risk:** chatgpt.com runs aggressive bot detection (Cloudflare). Removing chromedp's automation flags (already done, same as Gemini) and `--headless=new` usually pass, but it can break without warning — the login flow and the panel's connect button are the recovery path.
+
+---
+
 ## Roadmap — next steps
 
 Ordered by impact for the main use case (agentic coding with a Gemini Pro subscription):
@@ -418,6 +440,7 @@ Ordered by impact for the main use case (agentic coding with a Gemini Pro subscr
 5. ~~**Multi-profile pool**~~ — **done**: `BIFROST_PROFILES` runs one browser per account in round-robin with conversation affinity (see [Multi-Profile](#multi-profile-multiple-accounts)).
 6. **Sticky state persistence** — store conversation URLs + history hashes on disk so agent sessions survive gateway restarts.
 7. **Observer-only completion detection** — silence-based generation-end detection to retire most of the 300ms polling.
+8. ~~**ChatGPT driver**~~ — **done** (engine + driver): calibrate selectors against a logged-in page and promote from provisional.
 
 ---
 
