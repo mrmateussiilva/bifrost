@@ -241,28 +241,35 @@ func runTest(ctx context.Context, cfg Config, prompt string) error {
 	}
 	defer browser.Close()
 
-	if err := OpenGemini(browser.BootCtx); err != nil {
+	factory := GetProvider(cfg.Provider)
+	if err := factory.Open(browser.BootCtx); err != nil {
 		return err
 	}
 
-	g := NewGemini(browser.BootCtx)
+	w := factory.NewWorker(browser.BootCtx)
 
-	// toda chamada ao Gemini tem timeout
+	// toda chamada tem timeout
 	cctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 	defer cancel()
 
-	slog.Info("request received", "prompt", prompt)
-	resp, err := g.Complete(cctx, []Message{{Role: "user", Content: prompt}}, cfg.Model)
+	slog.Info("request received", "prompt", prompt, "provider", factory.Name())
+	resp, err := w.Complete(cctx, []Message{{Role: "user", Content: prompt}}, cfg.Model)
 	if err != nil {
 		// em caso de falha, despeja o DOM para diagnosticar seletores
-		if dump, derr := InspectGemini(browser.BootCtx); derr == nil {
-			slog.Error("falhou; despejo do DOM para diagnóstico:")
-			fmt.Println(dump)
+		// (diagnóstico do Gemini; outros provedores: logs)
+		if factory.Name() == "gemini" {
+			if dump, derr := InspectGemini(browser.BootCtx); derr == nil {
+				slog.Error("falhou; despejo do DOM para diagnóstico:")
+				fmt.Println(dump)
+			}
 		}
 		return err
 	}
 	fmt.Println(resp)
 
+	if factory.Name() != "gemini" {
+		return nil // dumps de estrutura são específicos do driver do Gemini
+	}
 	// esqueleto da resposta em JSON — confirmação dos seletores de extração
 	// (code blocks, markdown) com uma resposta ainda na tela. A espera de 5s
 	// deixa a UI pós-resposta (chips de follow-up etc.) renderizar, para o
